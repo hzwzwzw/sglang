@@ -48,6 +48,7 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
 from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
@@ -341,10 +342,6 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.free_slots = torch.arange(
-                1, self.size + 1, dtype=torch.int64, device=self.device
-            )
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
 
@@ -354,17 +351,6 @@ class MambaPool:
 
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_cache.at_layer_idx(layer_id)
-
-    def available_size(self):
-        return len(self.free_slots)
-
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        if need_size > len(self.free_slots):
-            return None
-
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-        return select_index
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
@@ -380,16 +366,6 @@ class MambaPool:
             t.shape[0], need_size, *t.shape[2:]
         )
         t[:, indices] = z
-
-    def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
-        self.free_slots = torch.cat((self.free_slots, free_index))
-
-    def clear(self):
-        self.free_slots = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
-        )
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
@@ -539,6 +515,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
+        self.mamba_allocator = MambaSlotAllocator(
+            size=mamba_size,
+            device=device,
+        )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
@@ -573,16 +553,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
                 pass
             else:
-                mid = self.mamba_pool.alloc(1)
+                mid = self.mamba_allocator.alloc(1)
                 assert (
                     mid is not None
-                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
+                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
             mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
-                    req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
+                    req.mamba_ping_pong_track_buffer = self.mamba_allocator.alloc(
                         self.mamba_ping_pong_track_buffer_size
                     )
                     assert (
@@ -635,7 +615,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ):
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
-        self.mamba_pool.free(mamba_index.unsqueeze(0))
+        self.mamba_allocator.free(mamba_index.unsqueeze(0))
         req.mamba_pool_idx = None
 
         if self.enable_mamba_extra_buffer:
@@ -669,12 +649,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     mamba_ping_pong_track_buffer_to_free = (
                         mamba_ping_pong_track_buffer_to_free[0:0]
                     )
-            self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
+            self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free)
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
-        self.mamba_pool.clear()
+        self.mamba_allocator.clear()
         self.req_index_to_mamba_index_mapping.zero_()
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
