@@ -2270,9 +2270,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # Every rank must enter the all_reduce below; ongoing_write_through can
+        # diverge across ranks (e.g. write_backup returning 0 on a subset).
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_write_queue:
@@ -2295,8 +2294,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def loading_check(self) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
-        if cc is None or not self.ongoing_load_back:
+        if cc is None:
             return
+        # Every rank must enter the all_reduce below; ongoing_load_back can
+        # diverge across ranks.
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_load_queue:
