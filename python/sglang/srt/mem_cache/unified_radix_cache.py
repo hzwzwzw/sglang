@@ -1880,7 +1880,7 @@ class UnifiedRadixCache(BasePrefixCache):
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
-            prefetch_key.token_ids,
+            prefetch_key,
             last_hash,
             prefix_keys,
             extra_pools=aux_xfers or None,
