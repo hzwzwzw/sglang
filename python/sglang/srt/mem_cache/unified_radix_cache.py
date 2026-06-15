@@ -1586,7 +1586,6 @@ class UnifiedRadixCache(BasePrefixCache):
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
-            self._record_store_event(node, medium=StorageMedium.CPU)
         if lock_params is not None:
             self.dec_lock_ref(lock_node, lock_params)
         if self.enable_storage:
