@@ -53,9 +53,7 @@ from sglang.srt.mem_cache.utils import (
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import (
-    STAT_LOGGER_ROLE_STORAGE,
     StorageMetricsCollector,
-    resolve_collector_class,
 )
 from sglang.srt.session.streaming_session import StreamingSession
 
@@ -2222,14 +2220,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 labels.update(extra_metric_labels)
             existing_collector = self.storage_metrics_collector
             if existing_collector is None:
-                from sglang.srt.server_args import get_global_server_args
-
-                storage_cls = resolve_collector_class(
-                    get_global_server_args(),
-                    STAT_LOGGER_ROLE_STORAGE,
-                    StorageMetricsCollector,
-                )
-                self.storage_metrics_collector = storage_cls(labels=labels)
+                self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
             elif set(existing_collector.labels.keys()) == set(labels.keys()):
                 existing_collector.labels = labels
             else:
