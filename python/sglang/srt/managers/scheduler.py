@@ -2533,11 +2533,71 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+
+            l3_dev = None
+            if self.enable_hicache_storage and hasattr(
+                self.tree_cache, "peek_prefetch_device_indices"
+            ):
+                # Per-req L3 handoff: the prefetched prefix lives in
+                # device slots that were allocated by check_prefetch_progress
+                # but NOT inserted into the radix tree (the async insert was
+                # the PP-rank desync source). Concatenate those device
+                # indices onto req.prefix_indices so the model forward sees
+                # the L3 prefix as already-cached. Subsequent reqs only see
+                # this prefix in the tree AFTER this req completes (via the
+                # synchronous cache_finished_req write-through).
+                #
+                # IMPORTANT: do NOT bump cache_protected_len. cache_unfinished_req
+                # at line 786 asserts cache_protected_len <= len(new_indices)+
+                # page_size-1, where new_indices comes from a fresh
+                # match_prefix that won't see L3 (not in tree). The L3
+                # portion is preserved across chunk boundaries via the
+                # kv_indices_orig branch at unified_radix_cache.py:803-805.
+                #
+                # PEEK only — committed via pop only after add_one_req
+                # returns CONTINUE. If add_one_req returns NO_TOKEN, the
+                # entry stays in tree_cache so the next scheduling attempt
+                # can re-inject without leaking the device slots.
+                l3_dev = self.tree_cache.peek_prefetch_device_indices(req.rid)
+                if l3_dev is not None and l3_dev.numel() > 0:
+                    req.prefix_indices = torch.cat([req.prefix_indices, l3_dev])
+                    req.set_extend_input_len(
+                        len(req.fill_ids) - len(req.prefix_indices)
+                    )
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            # Always finalize the L3 handoff once the req is admitted. Two
+            # cases:
+            #   (a) inject happened (l3_dev is not None): the device slots
+            #       are now referenced by req.prefix_indices and will be
+            #       freed by cache_finished_req via tree write-through. We
+            #       only need to remove the bookkeeping entry.
+            #   (b) inject did NOT happen (l3_dev is None — usually means
+            #       the PP consensus hadn't arrived yet when this req was
+            #       picked): the device slots in _prefetch_device_indices_by_reqid
+            #       are now orphaned (req is running without them). They
+            #       must be freed explicitly or the pool leaks. SWA paired
+            #       slots are freed via the full->swa mapping the load op
+            #       already wired up.
+            # On NO_TOKEN/OTHER, leave the entry so the next scheduling
+            # iteration can re-inject from the same device slots.
+            if (
+                res == AddReqResult.CONTINUE
+                and self.enable_hicache_storage
+                and hasattr(self.tree_cache, "pop_prefetch_device_indices")
+            ):
+                leftover_l3 = self.tree_cache.pop_prefetch_device_indices(req.rid)
+                if (
+                    leftover_l3 is not None
+                    and leftover_l3.numel() > 0
+                    and (l3_dev is None or l3_dev.numel() == 0)
+                ):
+                    self.token_to_kv_pool_allocator.free(leftover_l3)
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)

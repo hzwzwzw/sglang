@@ -417,6 +417,39 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        # Per-rank L3 prefetch -> device-indices handoff. Populated by
+        # check_prefetch_progress when the prefetch completes; popped by
+        # the scheduler in the prefill loop and concatenated onto
+        # req.prefix_indices. Used INSTEAD of inserting the prefetched
+        # prefix into the radix tree (the original async-insert path is the
+        # PP-rank desync source). See plan: per-request L3 handoff.
+        self._prefetch_device_indices_by_reqid: dict[str, torch.Tensor] = {}
+        # Outstanding handoff loads: maps a synthetic ack-id (negative,
+        # disjoint from real tree-node ids which are non-negative) to the
+        # host slots we need to release back to their pools once the H->D
+        # copy actually completes (via loading_check). Registered by
+        # check_prefetch_progress; drained by loading_check.
+        self._handoff_in_flight: dict[
+            int, tuple[Optional[torch.Tensor], list[PoolTransfer]]
+        ] = {}
+        self._handoff_id_counter: int = -1
+        # PP-consensus gate for the per-req L3 handoff.
+        #
+        # ``_local_prefetch_done_rids`` is populated when this rank's
+        # ``check_prefetch_progress`` finishes the H->D handoff for a rid;
+        # the disagg-prefill PP loop ring-intersects local sets across PP
+        # ranks every iter and writes the global consensus into
+        # ``_global_consensus_prefetch_done``. ``peek_prefetch_device_indices``
+        # only exposes a rid when it's in the global set: this is what
+        # prevents cross-PP desync (one rank sees prefetch done, another
+        # doesn't, schedule diverges, IPC shape mismatch crash).
+        #
+        # For pp_size==1 the gate is bypassed (no desync possible).
+        # For pp_size>1 BEFORE the ring is installed,
+        # ``_global_consensus_prefetch_done`` stays empty -> peek always
+        # returns None -> equivalent to "L3 disabled" (safe but no perf).
+        self._local_prefetch_done_rids: set[str] = set()
+        self._global_consensus_prefetch_done: set[str] = set()
         self.ongoing_prefetch: dict[
             str,
             tuple[
@@ -1937,6 +1970,63 @@ class UnifiedRadixCache(BasePrefixCache):
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
 
+    def _build_load_pools_from_prefetch(
+        self,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+        hit_pages: dict[PoolName, int],
+        fetched_host: torch.Tensor,
+        max_tokens: int,
+    ) -> list[PoolTransfer]:
+        """Build ``extra_pools`` for ``cache_controller.load`` from a completed
+        prefetch's per-component host transfers.
+
+        Mirrors the pattern in ``init_load_back`` (line ~1626): take per-
+        component host_indices, truncate to TP-allreduce-min'd hit pages,
+        flatten, and append rebuilt sidecar pool transfers. Used by the
+        per-req L3 handoff path in ``check_prefetch_progress`` to deliver
+        the prefetched prefix directly to the triggering req without
+        inserting into the radix tree (the original async-insert path is
+        the PP-rank desync source).
+
+        ``max_tokens`` is an additional cap (the caller computed
+        ``effective_hit_tokens``) so SWA-equivalent slots can be aligned
+        to the same length as the main fetched_host. Without this, main
+        and SWA can have mismatched per-token allocations and the
+        full->swa mapping setter silently no-ops, leaking SWA slots.
+        """
+        truncated_comp: dict[ComponentType, list[PoolTransfer]] = {}
+        for ct, xfers in comp_xfers.items():
+            kept: list[PoolTransfer] = []
+            for t in xfers:
+                n_pages = hit_pages.get(t.name, 0)
+                tokens = n_pages * self.page_size
+                if tokens == 0 or t.host_indices is None:
+                    continue
+                tokens = min(tokens, t.host_indices.numel(), max_tokens)
+                if tokens == 0:
+                    continue
+                kept.append(
+                    PoolTransfer(
+                        name=t.name,
+                        host_indices=t.host_indices[:tokens],
+                        keys=t.keys,
+                        indices_from_pool=t.indices_from_pool,
+                    )
+                )
+            if kept:
+                truncated_comp[ct] = kept
+
+        out: list[PoolTransfer] = [
+            x for xfers in truncated_comp.values() for x in xfers
+        ]
+        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=fetched_host)
+        out.extend(
+            self._build_sidecar_transfers(
+                CacheTransferPhase.LOAD_BACK, kv_xfer, truncated_comp
+            )
+        )
+        return out
+
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             return True
@@ -1972,44 +2062,167 @@ class UnifiedRadixCache(BasePrefixCache):
             for i, p in enumerate(sidecar_pools, start=1):
                 hit_pages[p] = int(packed[i].item())
 
-        fetched_key = prefetch_key[:min_completed_tokens]
-        insert_result = self._insert_helper_host(
-            last_host_node,
-            fetched_key,
-            host_indices[:min_completed_tokens],
-            hash_value[: min_completed_tokens // self.page_size],
-        )
+        # Per-req L3 handoff (replaces the old radix-tree insert path).
+        # Rationale: inserting prefetched host nodes into the radix tree is
+        # async per PP rank and was the source of cross-rank prefix-match
+        # desync (different extend_seq_lens -> shape mismatch crash). We
+        # instead load the prefetched data H->D into device slots that are
+        # owned ONLY by the triggering req: the scheduler will pop these
+        # via pop_prefetch_device_indices() and concatenate onto
+        # req.prefix_indices. Subsequent reqs only see this prefix in the
+        # radix tree AFTER the triggering req completes (via the
+        # synchronous cache_finished_req write-through, which is
+        # PP-deterministic).
 
+        # Determine effective L3 hit length: bounded by both KV and SWA
+        # hits. The model's attention on a prefix token requires BOTH the
+        # full-pool KV (main) and the SWA-window KV (sidecar). If only one
+        # is loaded, that token's attention output is wrong. We also need
+        # main and SWA allocated lengths to match so the SWA full->swa
+        # mapping (set below) is one-to-one. So truncate to the
+        # intersection of "what mooncake managed to load" across pools.
+        effective_hit_tokens = min_completed_tokens
         for ct, xfers in comp_xfers.items():
-            self.components[ct].commit_hicache_transfer(
-                last_host_node,
-                CacheTransferPhase.PREFETCH,
-                xfers,
-                insert_result=insert_result,
-                pool_storage_result=operation.pool_storage_result,
-            )
+            for t in xfers:
+                if t.name == PoolName.SWA:
+                    swa_tokens = hit_pages.get(t.name, 0) * self.page_size
+                    effective_hit_tokens = min(effective_hit_tokens, swa_tokens)
 
-        self.cache_controller.mem_pool_host.free(
-            host_indices[: insert_result.prefix_len]
-        )
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
+        fetched_host = host_indices[:effective_hit_tokens]
+        device_indices: Optional[torch.Tensor] = None
+        sidecar_extras: list[PoolTransfer] = []
+        if effective_hit_tokens > 0:
+            sidecar_extras = self._build_load_pools_from_prefetch(
+                comp_xfers, hit_pages, fetched_host, effective_hit_tokens
+            )
+            # Allocate a unique negative ack-id so it's disjoint from real
+            # tree-node ids (which are non-negative). This id flows
+            # through CacheOperation.merge_ops and lands in the ack_list
+            # at loading_check time, where we use it to release host slots
+            # exactly after the H->D copy is observed complete.
+            handoff_id = self._handoff_id_counter
+            self._handoff_id_counter -= 1
+            # Register BEFORE issuing the load so loading_check can never
+            # see an ack_id we haven't recorded. Stash the host slots so
+            # they live until H->D actually completes (race-safe).
+            self._handoff_in_flight[handoff_id] = (fetched_host, sidecar_extras)
+            device_indices = self.cache_controller.load(
+                host_indices=fetched_host,
+                node_id=handoff_id,
+                extra_pools=sidecar_extras or None,
+            )
+            if device_indices is None:
+                # Load failed: undo the in-flight registration; we'll
+                # release host slots ourselves below.
+                self._handoff_in_flight.pop(handoff_id, None)
+            else:
+                # Wire the SWA full->swa mapping for the L3 prefix slots.
+                # Without this, two correctness issues:
+                #   1) The model's SWA attention reads stale/0 swa_indices
+                #      when computing attention on the L3 prefix tokens.
+                #   2) When the req completes (or aborts) and the existing
+                #      free path runs ``token_to_kv_pool_allocator.free(
+                #      kv_indices)``, the SWA allocator's free() reads the
+                #      mapping to locate paired SWA slots; with the mapping
+                #      unset (or stale), the SWA slots leak indefinitely
+                #      and OOM the SWA pool. Eviction of tree nodes
+                #      created at cache_finished_req time also relies on
+                #      the mapping (see swa_component.py:364 free_swa).
+                #
+                # _resolve_pool_transfers_allocation populated each
+                # sidecar PoolTransfer's ``device_indices`` field for us.
+                #
+                # NOTE: DeepSeekV4HiSparseTokenToKVPoolAllocator wraps the
+                # actual SWA allocator under ``logical_attn_allocator``
+                # (its own ``free()`` delegates there too — see
+                # hisparse.py:550-557). Walk the wrapper to find the
+                # method.
+                allocator = self.token_to_kv_pool_allocator
+                inner = getattr(allocator, "logical_attn_allocator", allocator)
+                set_swa_mapping = getattr(inner, "set_full_to_swa_mapping", None)
+                if set_swa_mapping is None:
+                    set_swa_mapping = getattr(
+                        allocator, "set_full_to_swa_mapping", None
+                    )
+                if set_swa_mapping is not None:
+                    for pool in sidecar_extras:
+                        if (
+                            pool.name == PoolName.SWA
+                            and pool.device_indices is not None
+                            and pool.device_indices.numel() == device_indices.numel()
+                        ):
+                            set_swa_mapping(device_indices, pool.device_indices)
+                            break
+
+        if device_indices is None:
+            # Either no hit (effective_hit_tokens == 0) or device alloc
+            # failure inside cache_controller.load. Release every host slot
+            # we allocated for this prefetch synchronously (no in-flight
+            # H->D to wait for) and record loaded_from_storage=0 so the
+            # scheduler treats this req as a no-L3-hit.
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed_tokens],
+                extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+            )
+            loaded_from_storage = 0
+        else:
+            # H->D load is queued; cache_controller.start_loading() will
+            # flush it on the next ready_to_load_host_cache() tick (see
+            # scheduler.py:2612). Host slots will be released by
+            # loading_check once the H->D event fires (see
+            # _handoff_in_flight handling there).
+            #
+            # Release the slack between effective_hit_tokens (what we hand
+            # off, bounded by min(KV, SWA)) and completed_tokens (raw KV
+            # alloc). These slots were never written to or were SWA-less.
+            tail = host_indices[effective_hit_tokens:completed_tokens]
+            if tail.numel() > 0:
+                self.cache_controller.append_host_mem_release(host_indices=tail)
+            # Also release sidecar host slots that exceed effective_hit_tokens
+            # (e.g., SWA host_indices at hit_pages[SWA]*page_size when that
+            # exceeds effective_hit_tokens). The first effective_hit_tokens
+            # of each sidecar are owned by the load op via _handoff_in_flight.
+            extra_tail: list[PoolTransfer] = []
+            for ct_xfers in comp_xfers.values():
+                for t in ct_xfers:
+                    if t.host_indices is None:
+                        continue
+                    overflow = t.host_indices[effective_hit_tokens:]
+                    if overflow.numel() > 0:
+                        extra_tail.append(
+                            PoolTransfer(
+                                name=t.name,
+                                host_indices=overflow,
+                                keys=t.keys,
+                                indices_from_pool=t.indices_from_pool,
+                            )
+                        )
+            if extra_tail:
+                self.cache_controller.append_host_mem_release(extra_pools=extra_tail)
+            self._prefetch_device_indices_by_reqid[req_id] = device_indices
+            # Register locally; the disagg-prefill PP loop ring-intersects
+            # this set every iter so a rid is exposed via
+            # peek_prefetch_device_indices only after ALL PP ranks confirm
+            # local completion. See _local_prefetch_done_rids docstring.
+            self._local_prefetch_done_rids.add(req_id)
+            loaded_from_storage = effective_hit_tokens
+
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
-        loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         logger.info(
-            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
+            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d "
+            "effective=%d loaded=%d tail_release=%d occupied=%d handoff=%d",
             req_id,
             completed_tokens,
             min_completed_tokens,
-            insert_result.prefix_len,
+            effective_hit_tokens,
             loaded_from_storage,
             completed_tokens - min_completed_tokens,
             self.cache_controller.prefetch_tokens_occupied,
+            int(device_indices is not None),
         )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
@@ -2026,8 +2239,54 @@ class UnifiedRadixCache(BasePrefixCache):
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def pop_prefetch_device_indices(self, req_id: str) -> Optional[torch.Tensor]:
+        """Pop the device-indices handoff produced by ``check_prefetch_progress``.
+
+        The scheduler calls this after ``add_one_req`` returns CONTINUE to
+        commit the L3 handoff for this req. If ``add_one_req`` fails (e.g.,
+        NO_TOKEN), the scheduler should NOT call pop, leaving the entry in
+        place so the next scheduling attempt can re-inject the L3 prefix
+        without leaking the device slots. See ``peek_prefetch_device_indices``.
+        Returns ``None`` if no handoff was produced (e.g., 0 hit, device
+        alloc failure, or prefetch wasn't issued).
+        """
+        # Cleanup the consensus tracking sets. Even if the rid wasn't yet
+        # in the global consensus (peek would have returned None and we
+        # shouldn't be here), draining keeps the sets bounded.
+        self._local_prefetch_done_rids.discard(req_id)
+        self._global_consensus_prefetch_done.discard(req_id)
+        return self._prefetch_device_indices_by_reqid.pop(req_id, None)
+
+    def peek_prefetch_device_indices(self, req_id: str) -> Optional[torch.Tensor]:
+        """Non-destructive read of the L3 handoff for this req.
+
+        Used by the scheduler to inject device indices into ``req.prefix_indices``
+        before calling ``add_one_req``. The actual ``pop`` happens only after
+        ``add_one_req`` returns CONTINUE — so a NO_TOKEN-rejected req can be
+        re-tried on the next scheduling iteration without losing its L3 slots.
+
+        For pp_size>1, the rid must be in ``_global_consensus_prefetch_done``
+        (i.e., ALL PP ranks have confirmed local prefetch completion via the
+        consensus ring) — otherwise we return None to keep PP ranks' schedule
+        decisions identical and avoid the IPC-shape-mismatch crash.
+        """
+        if self.pp_size > 1 and req_id not in self._global_consensus_prefetch_done:
+            return None
+        return self._prefetch_device_indices_by_reqid.get(req_id)
+
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        # Free any device-indices that were handed off but never consumed
+        # (e.g., prefetch finished, scheduler hadn't picked the req up
+        # yet, then req aborted). Without this, the device slots leak.
+        leftover = self._prefetch_device_indices_by_reqid.pop(rid, None)
+        # Drop consensus tracking entries for this rid; PP ring will not
+        # forward consensus on a rid that has dropped out of any rank's
+        # local set (the intersection naturally excludes it next round).
+        self._local_prefetch_done_rids.discard(rid)
+        self._global_consensus_prefetch_done.discard(rid)
+        if leftover is not None and leftover.numel() > 0:
+            self.token_to_kv_pool_allocator.free(leftover)
         if rid not in self.ongoing_prefetch:
             return
 
@@ -2308,8 +2567,48 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         if cc is None:
             return
-        # Every rank must enter the all_reduce below; ongoing_load_back can
-        # diverge across ranks.
+
+        # FIRST PASS — drain handoff acks (negative ack_id) per-rank, no PP
+        # sync. Reason: handoff loads are added to ack_load_queue from
+        # ``check_prefetch_progress`` at PP-divergent rates (prefetch
+        # completion timing varies per rank), so queue *length* is not
+        # lockstep across PP. The PP-synced pop below assumes lockstep.
+        # Stream FIFO guarantees: if a handoff entry's finish_event is
+        # ready, every entry queued before it on the same stream is also
+        # ready -- so draining handoff entries out-of-order from the
+        # middle of the queue is safe (we never skip ahead of an
+        # unfinished init_load_back entry, because its event also
+        # wouldn't be ready). Handoff acks only release host slots; they
+        # do NOT touch ``ongoing_load_back`` or ``dec_lock_ref`` state,
+        # so per-rank processing keeps the rest of the system PP-consistent.
+        if cc.ack_load_queue:
+            remaining: list = []
+            for entry in cc.ack_load_queue:
+                _, finish_event, ack_list = entry
+                is_handoff_entry = bool(ack_list) and all(aid < 0 for aid in ack_list)
+                if is_handoff_entry:
+                    if finish_event.query():
+                        finish_event.synchronize()
+                        for ack_id in ack_list:
+                            handoff = self._handoff_in_flight.pop(ack_id, None)
+                            if handoff is None:
+                                continue
+                            handoff_host, handoff_extras = handoff
+                            cc.append_host_mem_release(
+                                host_indices=handoff_host,
+                                extra_pools=handoff_extras or None,
+                            )
+                        # drained: don't keep in queue
+                        continue
+                remaining.append(entry)
+            # Mutate cc.ack_load_queue in-place to preserve identity.
+            cc.ack_load_queue[:] = remaining
+
+        # SECOND PASS — PP-synced pop of init_load_back acks. After the
+        # filter above, ack_load_queue contains only init_load_back
+        # entries (positive node_ids), which ARE added in lockstep across
+        # PP ranks. So queue lengths match and the all-reduce-MIN-based
+        # pop is sound, exactly like before this refactor.
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in cc.ack_load_queue:
@@ -2324,6 +2623,18 @@ class UnifiedRadixCache(BasePrefixCache):
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
+                # Defensive: a handoff entry should have been drained
+                # above; if for any reason one slipped through (e.g.
+                # batched mixed ack_list), still handle it without
+                # touching ongoing_load_back.
+                handoff = self._handoff_in_flight.pop(ack_id, None)
+                if handoff is not None:
+                    handoff_host, handoff_extras = handoff
+                    cc.append_host_mem_release(
+                        host_indices=handoff_host,
+                        extra_pools=handoff_extras or None,
+                    )
+                    continue
                 node, lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
             finish_count -= 1

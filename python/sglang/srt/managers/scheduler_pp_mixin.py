@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -36,8 +37,99 @@ from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
+# Optional per-step diagnostic logging for PP-rank scheduling/launch state.
+# Enabled via SGLANG_PP_DESYNC_DIAG=1. Used to debug shape-mismatch crashes
+# caused by L3 prefetch radix-tree desync across PP ranks; harmless
+# otherwise (no collectives, just per-rank logging).
+_PP_DESYNC_DIAG = os.environ.get("SGLANG_PP_DESYNC_DIAG", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+
+def _pp_desync_log_schedule(self: "Scheduler", mb_id: int, batch) -> None:
+    """Log per-rank scheduling result so we can compare across PP ranks.
+
+    Triggered by SGLANG_PP_DESYNC_DIAG=1. Used to spot the shape-mismatch
+    crash caused by L3 prefetch radix-tree desync (different
+    extend_seq_lens across PP ranks for the same req_id).
+    """
+    pp = self.ps.pp_rank
+    tp = self.ps.tp_rank
+    step = self.forward_ct
+    if batch is None:
+        logger.warning(
+            "[PP_DESYNC schedule] step=%d mb=%d pp=%d tp=%d batch=None waiting=%d chunked=%s",
+            step,
+            mb_id,
+            pp,
+            tp,
+            len(self.waiting_queue),
+            self.chunked_req is not None,
+        )
+        return
+    summary = []
+    for r in batch.reqs[:6]:
+        prefix = (
+            len(r.prefix_indices)
+            if getattr(r, "prefix_indices", None) is not None
+            else 0
+        )
+        summary.append(
+            (
+                r.rid[-8:],
+                prefix,
+                getattr(r, "host_hit_length", 0),
+                getattr(r, "extend_input_len", None),
+            )
+        )
+    logger.warning(
+        "[PP_DESYNC schedule] step=%d mb=%d pp=%d tp=%d nreq=%d ext_tok=%s chunked=%s reqs=%s",
+        step,
+        mb_id,
+        pp,
+        tp,
+        len(batch.reqs),
+        getattr(batch, "extend_num_tokens", "?"),
+        self.chunked_req is not None,
+        summary,
+    )
+
+
+def _pp_desync_log_launch(self: "Scheduler", mb_id: int, pp_proxy_tensors) -> None:
+    """Log what _pp_launch_batch is about to feed into run_batch.
+
+    Crash signature is ``cur_ext != ipc_hs[0]`` — i.e. local positions
+    tensor length doesn't match the IPC hidden_states length received from
+    the previous PP rank.
+    """
+    cur = self.cur_batch
+    if cur is None:
+        return
+    ipc_hs_shape = None
+    if pp_proxy_tensors is not None:
+        try:
+            ipc_hs_shape = tuple(pp_proxy_tensors["hidden_states"].shape)
+        except (KeyError, AttributeError):
+            ipc_hs_shape = "?"
+    input_ids = getattr(cur, "input_ids", None)
+    input_ids_shape = tuple(input_ids.shape) if hasattr(input_ids, "shape") else None
+    logger.warning(
+        "[PP_DESYNC launch] step=%d mb=%d pp=%d tp=%d cur_ext=%s nreq=%d input_ids=%s ipc_hs=%s",
+        self.forward_ct,
+        mb_id,
+        self.ps.pp_rank,
+        self.ps.tp_rank,
+        getattr(cur, "extend_num_tokens", "?"),
+        len(cur.reqs),
+        input_ids_shape,
+        ipc_hs_shape,
+    )
 
 
 @dataclass
@@ -200,6 +292,27 @@ class SchedulerPPMixin:
         send_consensus_bootstrapped_work = []
         send_release_work = []
 
+        # L3-prefetch consensus ring (per-iter, mirrors bootstrap/release).
+        # Enabled iff the tree cache exposes the consensus state -- without
+        # the ring, the gating in peek_prefetch_device_indices keeps L3 off.
+        # All ranks must compute the same flag value or the ring will
+        # desync (mismatched send/recv counts). Same config across ranks =>
+        # same flag.
+        l3_consensus_ring_enabled = self.enable_hicache_storage and hasattr(
+            self.tree_cache, "_global_consensus_prefetch_done"
+        )
+        pmbs: List[Optional[List[str]]] = [None] * self.pp_loop_size
+        consensus_prefetch_done_rids: Optional[List[str]] = None
+        send_prefetch_done_work = []
+        send_consensus_prefetch_done_work = []
+        if l3_consensus_ring_enabled:
+            logger.info(
+                "[hicache] L3 prefetch-done consensus ring enabled (pp_size=%d, pp_loop_size=%d). "
+                "Per-req L3 inject is gated on full-PP consensus to prevent IPC shape mismatch.",
+                self.ps.pp_size,
+                self.pp_loop_size,
+            )
+
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -211,6 +324,7 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_release_rids = None
                 next_consensus_bootstrapped_rids = None
+                next_consensus_prefetch_done_rids = None
                 d2h_event = None
                 next_batch_result = None
 
@@ -228,8 +342,23 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
+                # PHASE A of L3-prefetch consensus ring: ring-intersect
+                # local "prefetch-done" sets across PP ranks. By the time
+                # this reaches the last rank, the intersection IS the
+                # global consensus. Send order (same iter, end of loop)
+                # MUST match recv order (same iter, here): bootstrapped ->
+                # transferred -> prefetch_done. Skipped entirely when L3
+                # is off so the ring stays inert.
+                prefetch_done_rids: List[str] = []
+                if l3_consensus_ring_enabled:
+                    prefetch_done_rids = self._pp_pd_get_prefetch_done_ids()
+                    pmbs[mb_id] = prefetch_done_rids
+                    self._pp_commit_comm_work(send_prefetch_done_work)
+
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
+                if _PP_DESYNC_DIAG:
+                    _pp_desync_log_schedule(self, mb_id, batch)
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
@@ -275,6 +404,22 @@ class SchedulerPPMixin:
                     )
                 )
 
+                # PHASE B of L3-prefetch consensus ring: forward consensus.
+                # last_rank's PHASE-A intersection IS the global consensus;
+                # forward it ring-back to first_rank. Other ranks just
+                # forward what came from prev (received below). Mirrors
+                # the release ring exactly.
+                if l3_consensus_ring_enabled:
+                    (
+                        send_consensus_prefetch_done_work,
+                        consensus_prefetch_done_rids,
+                    ) = self._pp_pd_send_consensus_prefetch_done_ids(
+                        pmbs,
+                        next_first_rank_mb_id,
+                        consensus_prefetch_done_rids,
+                        prefetch_done_rids,
+                    )
+
                 if bmbs[next_mb_id] is not None:
                     next_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
@@ -286,6 +431,48 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
+
+                # Recv L3-prefetch consensus from prev rank (paired with
+                # the PHASE-B send above), and apply directly to the
+                # tree_cache global set so the NEXT add_one_req sees
+                # those rids as eligible for L3 inject. Recv order MUST
+                # be: consensus_bootstrapped -> release -> consensus_prefetch_done
+                # to match the send order from prev rank.
+                if l3_consensus_ring_enabled:
+                    if pmbs[next_mb_id] is not None:
+                        # _pp_recv_pyobj_from_prev_stage internally
+                        # broadcasts to all attn_tp / attn_cp ranks, so
+                        # every TP/CP rank receives the same consensus
+                        # set -- schedule decisions stay TP-consistent.
+                        next_consensus_prefetch_done_rids = (
+                            self._pp_recv_pyobj_from_prev_stage()
+                        )
+                        if next_consensus_prefetch_done_rids:
+                            # Filter out rids whose handoff slots have
+                            # already been freed locally (e.g., the req
+                            # aborted before consensus arrived). Without
+                            # this, _global would accumulate dead rids
+                            # forever — peek would return None for them
+                            # so correctness is fine, but memory grows.
+                            tc = self.tree_cache
+                            live = [
+                                rid
+                                for rid in next_consensus_prefetch_done_rids
+                                if rid in tc._prefetch_device_indices_by_reqid
+                            ]
+                            tc._global_consensus_prefetch_done.update(live)
+                            if _PP_DESYNC_DIAG and live:
+                                logger.info(
+                                    "[hicache] L3 consensus admit pp=%d mb=%d n_live=%d n_recv=%d "
+                                    "global=%d local=%d",
+                                    self.ps.pp_rank,
+                                    mb_id,
+                                    len(live),
+                                    len(next_consensus_prefetch_done_rids),
+                                    len(tc._global_consensus_prefetch_done),
+                                    len(tc._local_prefetch_done_rids),
+                                )
+                    self._pp_commit_comm_work(send_consensus_prefetch_done_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -307,6 +494,15 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
+                    # PHASE-A send for the L3-prefetch consensus ring.
+                    # Order MUST match the recv order on next rank's
+                    # PHASE-A intersect step: bootstrapped -> transferred
+                    # -> prefetch_done. Skipped when L3 is off so the
+                    # ring is fully inert.
+                    if l3_consensus_ring_enabled:
+                        send_prefetch_done_work = self._pp_send_pyobj_to_next_stage(
+                            prefetch_done_rids, async_send=True
+                        )
                     if self.cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -320,6 +516,8 @@ class SchedulerPPMixin:
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
+                if l3_consensus_ring_enabled:
+                    consensus_prefetch_done_rids = next_consensus_prefetch_done_rids
 
                 self.running_batch.batch_is_full = False
 
@@ -857,6 +1055,67 @@ class SchedulerPPMixin:
                 )
         return send_release_work, release_rids
 
+    def _pp_pd_get_prefetch_done_ids(self: Scheduler) -> List[str]:
+        """PHASE A of the L3 prefetch-done consensus ring.
+
+        Each rank reports its local "prefetch-done" rid set; downstream
+        ranks intersect with their own. By the time the chain reaches the
+        last rank, the intersection IS the global consensus.
+
+        Mirrors ``_pp_pd_get_prefill_transferred_ids`` in shape (single
+        list, ring-intersect). The local set is owned by ``tree_cache``
+        and populated by ``check_prefetch_progress`` when the per-rank
+        H->D handoff completes.
+
+        Safety: this is a strict mirror of the bootstrap ring (FIFO P2P
+        on the same channel, async sends, recv gated by pmbs slot). No
+        new sync points or collectives.
+        """
+        local_done = sorted(self._tree_cache_local_prefetch_done_rids())
+        if self.pp_group.is_first_rank:
+            return local_done
+        prev_done = self._pp_recv_pyobj_from_prev_stage()
+        # Intersection: a rid is "globally done" only if EVERY rank says
+        # so. Done-on-some-but-not-all => stays out of consensus this
+        # round; we'll retry next iter once the slow rank catches up.
+        return list(set(prev_done) & set(local_done))
+
+    def _pp_pd_send_consensus_prefetch_done_ids(
+        self: Scheduler,
+        pmbs: List[Optional[List[str]]],
+        next_first_rank_mb_id: int,
+        consensus_prefetch_done_rids: Optional[List[str]],
+        prefetch_done_rids: List[str],
+    ):
+        """PHASE B of the L3 prefetch-done consensus ring.
+
+        Last rank: its PHASE-A intersection is the full global consensus;
+        forward to next rank (which is the first rank, ring-back).
+        Other ranks: forward whatever consensus we received from prev.
+
+        Mirrors ``_pp_pd_send_consensus_release_ids`` exactly.
+        """
+        send_consensus_prefetch_done_work = []
+        if self.pp_group.is_last_rank:
+            if pmbs[next_first_rank_mb_id] is not None:
+                consensus_prefetch_done_rids = prefetch_done_rids
+                send_consensus_prefetch_done_work = self._pp_send_pyobj_to_next_stage(
+                    consensus_prefetch_done_rids, async_send=True
+                )
+        else:
+            if consensus_prefetch_done_rids is not None:
+                send_consensus_prefetch_done_work = self._pp_send_pyobj_to_next_stage(
+                    consensus_prefetch_done_rids, async_send=True
+                )
+        return send_consensus_prefetch_done_work, consensus_prefetch_done_rids
+
+    def _tree_cache_local_prefetch_done_rids(self: Scheduler) -> set:
+        """Adapter so the ring helper does not assume a specific tree cache."""
+        tc = getattr(self, "tree_cache", None)
+        if tc is None:
+            return set()
+        return getattr(tc, "_local_prefetch_done_rids", set())
+
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
             p2p_work.work.wait()
@@ -1163,6 +1422,8 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
+        if _PP_DESYNC_DIAG:
+            _pp_desync_log_launch(self, mb_id, pp_proxy_tensors)
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
