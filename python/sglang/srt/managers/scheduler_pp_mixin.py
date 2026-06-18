@@ -62,15 +62,41 @@ def _pp_desync_log_schedule(self: "Scheduler", mb_id: int, batch) -> None:
     pp = self.ps.pp_rank
     tp = self.ps.tp_rank
     step = self.forward_ct
+    # Snapshot consensus state at this schedule moment: exposing this on
+    # crashes pins the moment a rank's L3 view diverges (a rid that's
+    # in _global on one rank but not another at the SAME mb_id is the
+    # signature for cascade desync via chunked_req drift).
+    tc = getattr(self, "tree_cache", None)
+    g_keys = []
+    g_size = 0
+    l_size = 0
+    if tc is not None:
+        gset = getattr(tc, "_global_consensus_prefetch_done", None)
+        if gset is not None:
+            g_size = len(gset)
+            # Hash stable signature so cross-rank comparison is cheap.
+            try:
+                g_keys = sorted(gset.keys()) if isinstance(gset, dict) else sorted(gset)
+                g_keys = [k[-8:] for k in g_keys[:8]]
+            except Exception:
+                g_keys = []
+        lset = getattr(tc, "_local_prefetch_done_rids", None)
+        if lset is not None:
+            l_size = len(lset)
+    chunked_rid = self.chunked_req.rid[-8:] if self.chunked_req is not None else None
     if batch is None:
         logger.warning(
-            "[PP_DESYNC schedule] step=%d mb=%d pp=%d tp=%d batch=None waiting=%d chunked=%s",
+            "[PP_DESYNC schedule] step=%d mb=%d pp=%d tp=%d batch=None waiting=%d "
+            "chunked=%s g_size=%d g_keys=%s l_size=%d",
             step,
             mb_id,
             pp,
             tp,
             len(self.waiting_queue),
-            self.chunked_req is not None,
+            chunked_rid,
+            g_size,
+            g_keys,
+            l_size,
         )
         return
     summary = []
@@ -85,18 +111,23 @@ def _pp_desync_log_schedule(self: "Scheduler", mb_id: int, batch) -> None:
                 r.rid[-8:],
                 prefix,
                 getattr(r, "host_hit_length", 0),
+                getattr(r, "storage_hit_length", 0),
                 getattr(r, "extend_input_len", None),
             )
         )
     logger.warning(
-        "[PP_DESYNC schedule] step=%d mb=%d pp=%d tp=%d nreq=%d ext_tok=%s chunked=%s reqs=%s",
+        "[PP_DESYNC schedule] step=%d mb=%d pp=%d tp=%d nreq=%d ext_tok=%s "
+        "chunked=%s g_size=%d g_keys=%s l_size=%d reqs=%s",
         step,
         mb_id,
         pp,
         tp,
         len(batch.reqs),
         getattr(batch, "extend_num_tokens", "?"),
-        self.chunked_req is not None,
+        chunked_rid,
+        g_size,
+        g_keys,
+        l_size,
         summary,
     )
 
