@@ -2575,6 +2575,23 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
+            # Whether this req was actually admitted to the running batch
+            # this iter. add_one_req returns CONTINUE in the common case,
+            # but it can ALSO return OTHER when the req was admitted as a
+            # chunked-prefill *tail* that exhausted rem_chunk_tokens
+            # (PrefillAdder.add_one_req line 815-819 -> budget_state()
+            # returns OTHER when rem_chunk_tokens hits 0 right after the
+            # append). In that case the req IS in can_run_list and WILL
+            # be scheduled, but `res != CONTINUE` so a CONTINUE-only
+            # check would silently skip the L3 handoff cleanup -- the
+            # exact orphan path the diagnostic log pinned (rid sat in
+            # _prefetch_device_indices_by_reqid forever, leaking 1 page).
+            #
+            # Detect "actually admitted" by checking can_run_list's tail.
+            req_was_admitted = (
+                bool(adder.can_run_list) and adder.can_run_list[-1] is req
+            )
+
             # Always finalize the L3 handoff once the req is admitted. Two
             # cases:
             #   (a) inject happened (l3_dev is not None): the device slots
@@ -2588,10 +2605,11 @@ class Scheduler(
             #       must be freed explicitly or the pool leaks. SWA paired
             #       slots are freed via the full->swa mapping the load op
             #       already wired up.
-            # On NO_TOKEN/OTHER, leave the entry so the next scheduling
-            # iteration can re-inject from the same device slots.
+            # On NO_TOKEN (req NOT in can_run_list), leave the entry so
+            # the next scheduling iteration can re-inject from the same
+            # device slots.
             if (
-                res == AddReqResult.CONTINUE
+                req_was_admitted
                 and self.enable_hicache_storage
                 and self._tree_cache_supports_l3_handoff
             ):
