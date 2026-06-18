@@ -3136,17 +3136,6 @@ class Scheduler(
         if not self.is_fully_idle():
             return
 
-        # L3-handoff scrub: by the time we're fully idle, any remaining
-        # entry in tree_cache._prefetch_device_indices_by_reqid is an
-        # orphan (no req owns it). Free them before the leak check so
-        # this rare race / control-flow bypass doesn't bring down the
-        # scheduler. The scrub logs a warning when it finds any rid so
-        # we can track the source down.
-        if self.enable_hicache_storage and hasattr(
-            self.tree_cache, "scrub_orphan_prefetch_handoffs"
-        ):
-            self.tree_cache.scrub_orphan_prefetch_handoffs()
-
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:
