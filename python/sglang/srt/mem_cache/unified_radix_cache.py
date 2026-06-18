@@ -435,21 +435,29 @@ class UnifiedRadixCache(BasePrefixCache):
         self._handoff_id_counter: int = -1
         # PP-consensus gate for the per-req L3 handoff.
         #
-        # ``_local_prefetch_done_rids`` is populated when this rank's
-        # ``check_prefetch_progress`` finishes the H->D handoff for a rid;
-        # the disagg-prefill PP loop ring-intersects local sets across PP
-        # ranks every iter and writes the global consensus into
-        # ``_global_consensus_prefetch_done``. ``peek_prefetch_device_indices``
-        # only exposes a rid when it's in the global set: this is what
-        # prevents cross-PP desync (one rank sees prefetch done, another
-        # doesn't, schedule diverges, IPC shape mismatch crash).
+        # ``_local_prefetch_done_rids`` maps rid -> local effective_hit_tokens
+        # (set by check_prefetch_progress). The disagg-prefill PP loop
+        # ring-intersects local maps across PP ranks every iter,
+        # **taking MIN of effective_hit_tokens** per rid, and writes the
+        # global agreed length into ``_global_consensus_prefetch_done``
+        # (also a dict, rid -> agreed length).
+        #
+        # ``peek_prefetch_device_indices`` only exposes a rid when it's
+        # in the global dict, AND truncates the device-indices tensor to
+        # the agreed length. This prevents two failure modes:
+        #   (1) cross-PP "did the prefetch finish?" disagreement (the
+        #       presence-only consensus already handled this);
+        #   (2) cross-PP "how many tokens did it load?" disagreement
+        #       (this length consensus is the new fix). Without (2),
+        #       different PP ranks inject different numbers of tokens
+        #       onto req.prefix_indices => extend_input_len diverges =>
+        #       IPC shape mismatch crash.
         #
         # For pp_size==1 the gate is bypassed (no desync possible).
-        # For pp_size>1 BEFORE the ring is installed,
-        # ``_global_consensus_prefetch_done`` stays empty -> peek always
-        # returns None -> equivalent to "L3 disabled" (safe but no perf).
-        self._local_prefetch_done_rids: set[str] = set()
-        self._global_consensus_prefetch_done: set[str] = set()
+        # For pp_size>1 BEFORE the ring is installed, ``_global`` stays
+        # empty -> peek always returns None -> equivalent to L3 disabled.
+        self._local_prefetch_done_rids: dict[str, int] = {}
+        self._global_consensus_prefetch_done: dict[str, int] = {}
         self.ongoing_prefetch: dict[
             str,
             tuple[
@@ -2200,11 +2208,13 @@ class UnifiedRadixCache(BasePrefixCache):
             if extra_tail:
                 self.cache_controller.append_host_mem_release(extra_pools=extra_tail)
             self._prefetch_device_indices_by_reqid[req_id] = device_indices
-            # Register locally; the disagg-prefill PP loop ring-intersects
-            # this set every iter so a rid is exposed via
-            # peek_prefetch_device_indices only after ALL PP ranks confirm
-            # local completion. See _local_prefetch_done_rids docstring.
-            self._local_prefetch_done_rids.add(req_id)
+            # Register locally with the OBSERVED effective_hit_tokens.
+            # The disagg-prefill PP loop ring-intersects this map every
+            # iter, taking MIN per rid, so peek can truncate to the
+            # PP-agreed length. Without the length, ranks with
+            # different observed lengths would inject different #tokens
+            # onto req.prefix_indices and crash with shape mismatch.
+            self._local_prefetch_done_rids[req_id] = effective_hit_tokens
             loaded_from_storage = effective_hit_tokens
 
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
@@ -2250,11 +2260,11 @@ class UnifiedRadixCache(BasePrefixCache):
         Returns ``None`` if no handoff was produced (e.g., 0 hit, device
         alloc failure, or prefetch wasn't issued).
         """
-        # Cleanup the consensus tracking sets. Even if the rid wasn't yet
+        # Cleanup the consensus tracking dicts. Even if the rid wasn't yet
         # in the global consensus (peek would have returned None and we
-        # shouldn't be here), draining keeps the sets bounded.
-        self._local_prefetch_done_rids.discard(req_id)
-        self._global_consensus_prefetch_done.discard(req_id)
+        # shouldn't be here), draining keeps the dicts bounded.
+        self._local_prefetch_done_rids.pop(req_id, None)
+        self._global_consensus_prefetch_done.pop(req_id, None)
         return self._prefetch_device_indices_by_reqid.pop(req_id, None)
 
     def peek_prefetch_device_indices(self, req_id: str) -> Optional[torch.Tensor]:
@@ -2266,12 +2276,26 @@ class UnifiedRadixCache(BasePrefixCache):
         re-tried on the next scheduling iteration without losing its L3 slots.
 
         For pp_size>1, the rid must be in ``_global_consensus_prefetch_done``
-        (i.e., ALL PP ranks have confirmed local prefetch completion via the
-        consensus ring) — otherwise we return None to keep PP ranks' schedule
-        decisions identical and avoid the IPC-shape-mismatch crash.
+        AND we truncate the device-indices tensor to the agreed length.
+        Each PP rank may have observed a different ``effective_hit_tokens``
+        from mooncake (TP all-reduce only TP-syncs, not PP-syncs); without
+        truncating to the global MIN, ranks would inject different #tokens
+        and IPC shapes would diverge. The agreed length is computed by the
+        ring as MIN over all ranks' local lengths.
         """
-        if self.pp_size > 1 and req_id not in self._global_consensus_prefetch_done:
-            return None
+        if self.pp_size > 1:
+            agreed_len = self._global_consensus_prefetch_done.get(req_id)
+            if agreed_len is None:
+                return None
+            indices = self._prefetch_device_indices_by_reqid.get(req_id)
+            if indices is None:
+                return None
+            # Truncate to the PP-agreed length so every rank injects the
+            # same #tokens. agreed_len <= local length by construction
+            # (ring takes MIN), so this is always a valid slice.
+            if agreed_len < indices.numel():
+                return indices[:agreed_len]
+            return indices
         return self._prefetch_device_indices_by_reqid.get(req_id)
 
     def release_aborted_request(self, rid: str) -> None:
@@ -2283,8 +2307,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Drop consensus tracking entries for this rid; PP ring will not
         # forward consensus on a rid that has dropped out of any rank's
         # local set (the intersection naturally excludes it next round).
-        self._local_prefetch_done_rids.discard(rid)
-        self._global_consensus_prefetch_done.discard(rid)
+        self._local_prefetch_done_rids.pop(rid, None)
+        self._global_consensus_prefetch_done.pop(rid, None)
         if leftover is not None and leftover.numel() > 0:
             self.token_to_kv_pool_allocator.free(leftover)
         if rid not in self.ongoing_prefetch:

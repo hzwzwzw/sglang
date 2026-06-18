@@ -301,8 +301,8 @@ class SchedulerPPMixin:
         l3_consensus_ring_enabled = self.enable_hicache_storage and hasattr(
             self.tree_cache, "_global_consensus_prefetch_done"
         )
-        pmbs: List[Optional[List[str]]] = [None] * self.pp_loop_size
-        consensus_prefetch_done_rids: Optional[List[str]] = None
+        pmbs: List[Optional[Dict[str, int]]] = [None] * self.pp_loop_size
+        consensus_prefetch_done_rids: Optional[Dict[str, int]] = None
         if l3_consensus_ring_enabled:
             logger.info(
                 "[hicache] L3 prefetch-done consensus ring enabled (pp_size=%d, pp_loop_size=%d). "
@@ -339,7 +339,11 @@ class SchedulerPPMixin:
                 # below at SEND TO NEXT also carries both payloads.
                 # When disabled, fall back to the original single-payload
                 # bootstrap path; prefetch-done state is unused.
-                prefetch_done_rids: List[str] = []
+                # prefetch_done is a dict[rid, effective_hit_tokens] -- the
+                # length is part of the consensus payload because PP
+                # ranks may observe different token counts under timeout
+                # policy and we MIN them to a single agreed length.
+                prefetch_done_rids: Dict[str, int] = {}
                 if l3_consensus_ring_enabled:
                     bootstrapped_rids, prefetch_done_rids = (
                         self._pp_pd_get_bootstrap_and_l3_done_ids()
@@ -424,11 +428,12 @@ class SchedulerPPMixin:
 
                 if bmbs[next_mb_id] is not None:
                     # Combined recv when L3 ring is enabled: consensus
-                    # payload is a (bootstrapped, prefetch_done) tuple
+                    # payload is a (bootstrapped, prefetch_done_dict) tuple
                     # produced by _pp_pd_send_consensus_bootstrap_and_l3_done_ids.
-                    # _pp_recv_pyobj_from_prev_stage() also broadcasts to
-                    # all attn_tp / attn_cp ranks so schedule decisions
-                    # stay TP-consistent.
+                    # prefetch_done_dict is rid -> agreed effective_hit_tokens
+                    # (PP-MIN). _pp_recv_pyobj_from_prev_stage() also
+                    # broadcasts to all attn_tp / attn_cp ranks so schedule
+                    # decisions stay TP-consistent.
                     raw = self._pp_recv_pyobj_from_prev_stage()
                     if l3_consensus_ring_enabled:
                         next_consensus_bootstrapped_rids, next_l3_payload = raw
@@ -438,11 +443,11 @@ class SchedulerPPMixin:
                         # (req aborted between PHASE A and PHASE B).
                         if next_l3_payload:
                             tc = self.tree_cache
-                            live = [
-                                rid
-                                for rid in next_l3_payload
+                            live = {
+                                rid: agreed_len
+                                for rid, agreed_len in next_l3_payload.items()
                                 if rid in tc._prefetch_device_indices_by_reqid
-                            ]
+                            }
                             tc._global_consensus_prefetch_done.update(live)
                             next_consensus_prefetch_done_rids = next_l3_payload
                             if _PP_DESYNC_DIAG and live:
@@ -457,7 +462,7 @@ class SchedulerPPMixin:
                                     len(tc._local_prefetch_done_rids),
                                 )
                         else:
-                            next_consensus_prefetch_done_rids = []
+                            next_consensus_prefetch_done_rids = {}
                     else:
                         next_consensus_bootstrapped_rids = raw
                     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
@@ -1112,14 +1117,19 @@ class SchedulerPPMixin:
         (``_pp_pd_get_bootstrapped_ids`` + ``_pp_pd_get_prefetch_done_ids``).
 
         Wire format on the ring (per non-first rank):
-            recv  ([prev_good, prev_bad], prev_prefetch_done)
-            send  ([new_good,  new_bad],  new_prefetch_done)
+            recv  ([prev_good, prev_bad], prev_prefetch_done_dict)
+            send  ([new_good,  new_bad],  new_prefetch_done_dict)
 
-        Bootstrap intersect (good) and union (bad) match the original
-        helper's semantics exactly. Prefetch-done intersect requires
-        every rank to confirm local completion. Used only by the
-        disagg-prefill loop; ``_pp_pd_get_bootstrapped_ids`` is left
-        intact for the decode loop and any non-L3-aware callers.
+        prefetch_done is a ``dict[rid, effective_hit_tokens]`` (NOT a set).
+        Intersection takes MIN of effective_hit_tokens per rid -- this
+        makes the consensus carry the agreed-on length, so peek can
+        truncate to that length and every PP rank injects exactly the
+        same #tokens. Without the length, ranks would inject different
+        amounts (mooncake completion timing varies per rank under
+        timeout policy) -> IPC shape mismatch crash.
+
+        Used only by the disagg-prefill loop; the standalone helpers are
+        left intact for the decode loop and any non-L3-aware callers.
         """
         local_good, local_bad = self.get_rids(
             self.disagg_prefill_bootstrap_queue.queue,
@@ -1127,7 +1137,7 @@ class SchedulerPPMixin:
             [KVPoll.WaitingForInput],
             [KVPoll.Failed],
         )
-        local_prefetch_done = sorted(self._tree_cache_local_prefetch_done_rids())
+        local_prefetch_done = self._tree_cache_local_prefetch_done_rids()
 
         if self.pp_group.is_first_rank:
             return [local_good, local_bad], local_prefetch_done
@@ -1138,7 +1148,14 @@ class SchedulerPPMixin:
 
         good = list(set(prev_good) & set(local_good))
         bad = list(set(prev_bad) | set(local_bad))
-        prefetch_done = list(set(prev_prefetch_done) & set(local_prefetch_done))
+        # MIN over PP ranks: a rid is in consensus only if every rank has
+        # it locally done; the length is the smallest count any rank
+        # observed (since each rank only allocated that many slots, and
+        # peek will truncate every rank's tensor to this length).
+        prefetch_done = {
+            rid: min(prev_prefetch_done[rid], local_prefetch_done[rid])
+            for rid in (set(prev_prefetch_done) & set(local_prefetch_done))
+        }
         return [good, bad], prefetch_done
 
     def _pp_pd_send_consensus_bootstrap_and_l3_done_ids(
@@ -1147,8 +1164,8 @@ class SchedulerPPMixin:
         next_first_rank_mb_id: int,
         consensus_bootstrapped_rids: Optional[List[List[str]]],
         bootstrapped_rids: List[List[str]],
-        consensus_prefetch_done_rids: Optional[List[str]],
-        prefetch_done_rids: List[str],
+        consensus_prefetch_done_rids: Optional[Dict[str, int]],
+        prefetch_done_rids: Dict[str, int],
     ):
         """Combined PHASE B forward for bootstrap + L3 prefetch-done.
 
@@ -1176,24 +1193,32 @@ class SchedulerPPMixin:
             if consensus_bootstrapped_rids is not None:
                 # mid rank: forward what we received last iter. Both
                 # consensus_* are set together by the recv block so they
-                # are either both None or both lists.
+                # are either both None or both populated. Default to {}
+                # rather than [] so the wire type stays a dict.
                 payload = (
                     consensus_bootstrapped_rids,
                     (
                         consensus_prefetch_done_rids
                         if consensus_prefetch_done_rids is not None
-                        else []
+                        else {}
                     ),
                 )
                 work = self._pp_send_pyobj_to_next_stage(payload, async_send=True)
         return work, consensus_bootstrapped_rids, consensus_prefetch_done_rids
 
-    def _tree_cache_local_prefetch_done_rids(self: Scheduler) -> set:
-        """Adapter so the ring helper does not assume a specific tree cache."""
+    def _tree_cache_local_prefetch_done_rids(self: Scheduler) -> Dict[str, int]:
+        """Adapter so the ring helper does not assume a specific tree cache.
+
+        Returns a snapshot dict of ``rid -> local effective_hit_tokens``.
+        """
         tc = getattr(self, "tree_cache", None)
         if tc is None:
-            return set()
-        return getattr(tc, "_local_prefetch_done_rids", set())
+            return {}
+        local = getattr(tc, "_local_prefetch_done_rids", None)
+        if local is None:
+            return {}
+        # Return a shallow copy snapshot so the caller can mutate freely.
+        return dict(local)
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
