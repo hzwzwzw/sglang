@@ -449,6 +449,12 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        # Cache hasattr lookup for the L3 handoff API (used per-req in the
+        # prefill schedule loop). tree_cache is set once and never
+        # replaced, so this stays valid for the scheduler's lifetime.
+        self._tree_cache_supports_l3_handoff = hasattr(
+            self.tree_cache, "peek_prefetch_device_indices"
+        )
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
@@ -2535,9 +2541,7 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
 
             l3_dev = None
-            if self.enable_hicache_storage and hasattr(
-                self.tree_cache, "peek_prefetch_device_indices"
-            ):
+            if self.enable_hicache_storage and self._tree_cache_supports_l3_handoff:
                 # Per-req L3 handoff: the prefetched prefix lives in
                 # device slots that were allocated by check_prefetch_progress
                 # but NOT inserted into the radix tree (the async insert was
@@ -2589,7 +2593,7 @@ class Scheduler(
             if (
                 res == AddReqResult.CONTINUE
                 and self.enable_hicache_storage
-                and hasattr(self.tree_cache, "pop_prefetch_device_indices")
+                and self._tree_cache_supports_l3_handoff
             ):
                 leftover_l3 = self.tree_cache.pop_prefetch_device_indices(req.rid)
                 if (

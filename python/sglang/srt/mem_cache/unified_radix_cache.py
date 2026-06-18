@@ -2581,7 +2581,17 @@ class UnifiedRadixCache(BasePrefixCache):
         # wouldn't be ready). Handoff acks only release host slots; they
         # do NOT touch ``ongoing_load_back`` or ``dec_lock_ref`` state,
         # so per-rank processing keeps the rest of the system PP-consistent.
-        if cc.ack_load_queue:
+        #
+        # Fast path: if no handoff is in flight, this whole O(N) scan can
+        # be skipped. Invariant (verified): ``_handoff_in_flight[id]``
+        # exists iff ``ack_load_queue`` has an entry whose ack_list
+        # contains ``id``. Both dict/queue are populated atomically before
+        # ``cache_controller.load`` (single-threaded scheduler) and
+        # drained together below; alloc-failed loads remove the dict
+        # entry without ever touching the queue. So an empty dict is a
+        # sufficient (and reliable) signal that the queue has zero
+        # handoff entries to look at.
+        if cc.ack_load_queue and self._handoff_in_flight:
             remaining: list = []
             for entry in cc.ack_load_queue:
                 _, finish_event, ack_list = entry
