@@ -3136,6 +3136,37 @@ class Scheduler(
         if not self.is_fully_idle():
             return
 
+        # Diagnostic for L3 handoff leak: at idle there should be zero
+        # entries in _prefetch_device_indices_by_reqid. If we see any,
+        # log the rids + slot count + handoff-in-flight count so we
+        # can identify the control-flow path that bypassed cleanup.
+        # Do NOT modify state here -- both the indices and consensus
+        # dicts are PP-shared via the ring; an asymmetric clear (one
+        # rank scrubs while another doesn't) creates schedule
+        # divergence and the 11-vs-8192 IPC mismatch we saw before.
+        if self.enable_hicache_storage and hasattr(
+            self.tree_cache, "_prefetch_device_indices_by_reqid"
+        ):
+            tc = self.tree_cache
+            n_handoffs = len(tc._prefetch_device_indices_by_reqid)
+            if n_handoffs > 0:
+                total_slots = sum(
+                    int(t.numel())
+                    for t in tc._prefetch_device_indices_by_reqid.values()
+                    if t is not None
+                )
+                rids_sample = list(tc._prefetch_device_indices_by_reqid.keys())[:20]
+                logger.warning(
+                    "[hicache] L3 handoff orphans at idle: %d rid(s) holding %d slots, "
+                    "in_flight=%d, local=%d, global=%d. Sample rids: %s. (diagnostic; state not modified)",
+                    n_handoffs,
+                    total_slots,
+                    len(getattr(tc, "_handoff_in_flight", {})),
+                    len(getattr(tc, "_local_prefetch_done_rids", {})),
+                    len(getattr(tc, "_global_consensus_prefetch_done", {})),
+                    rids_sample,
+                )
+
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:
