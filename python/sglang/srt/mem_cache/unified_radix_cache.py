@@ -2359,6 +2359,47 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
+    def scrub_orphan_prefetch_handoffs(self) -> int:
+        """Backstop: free any device-indices left in the per-req handoff
+        dict and clear consensus tracking. Intended to be called from
+        ``on_idle`` when the scheduler has zero in-flight reqs -- by that
+        point any remaining ``_prefetch_device_indices_by_reqid`` entry
+        is by definition orphan (no req owns it).
+
+        Plugs leaks where ``pop_prefetch_device_indices`` /
+        ``release_aborted_request`` weren't called along some control
+        flow (rare race or cleanup bypass). Logs the count + total slots
+        for diagnosis -- recurring non-zero scrubs at idle indicate a
+        leak source we should track down.
+
+        Returns the number of rids cleaned up.
+        """
+        if not self._prefetch_device_indices_by_reqid:
+            # Also drain the consensus dicts in case they have stragglers.
+            self._local_prefetch_done_rids.clear()
+            self._global_consensus_prefetch_done.clear()
+            return 0
+        total_slots = 0
+        rids = list(self._prefetch_device_indices_by_reqid.keys())
+        for rid in rids:
+            indices = self._prefetch_device_indices_by_reqid.pop(rid, None)
+            self._local_prefetch_done_rids.pop(rid, None)
+            self._global_consensus_prefetch_done.pop(rid, None)
+            if indices is not None and indices.numel() > 0:
+                total_slots += indices.numel()
+                self.token_to_kv_pool_allocator.free(indices)
+        # Drain any consensus stragglers that didn't have a handoff entry.
+        self._local_prefetch_done_rids.clear()
+        self._global_consensus_prefetch_done.clear()
+        if rids:
+            logger.warning(
+                "[hicache] scrub_orphan_prefetch_handoffs freed %d rid(s) / %d slots at idle. "
+                "These were not popped along the normal scheduler / abort paths.",
+                len(rids),
+                total_slots,
+            )
+        return len(rids)
+
     def _drain_storage_control_queues_impl(
         self,
         n_revoke: Optional[int],
