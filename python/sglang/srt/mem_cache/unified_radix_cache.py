@@ -2259,13 +2259,37 @@ class UnifiedRadixCache(BasePrefixCache):
         without leaking the device slots. See ``peek_prefetch_device_indices``.
         Returns ``None`` if no handoff was produced (e.g., 0 hit, device
         alloc failure, or prefetch wasn't issued).
+
+        When length-consensus truncation applies (pp_size>1 and
+        ``_global_consensus_prefetch_done`` has a smaller length than this
+        rank's local tensor), this method **frees the unused tail** so it
+        doesn't leak. Without this, ranks whose local effective_hit_tokens
+        exceeded the PP-MIN would alloc more slots than they ever inject;
+        cache_finished_req only writes prefix_indices (the truncated
+        head) to the radix tree, so the tail is invisible to eviction
+        and stays allocated forever -- exactly the 1-page leak observed
+        in long-context workloads where mooncake completion times are
+        more spread across PP ranks.
         """
         # Cleanup the consensus tracking dicts. Even if the rid wasn't yet
         # in the global consensus (peek would have returned None and we
         # shouldn't be here), draining keeps the dicts bounded.
         self._local_prefetch_done_rids.pop(req_id, None)
-        self._global_consensus_prefetch_done.pop(req_id, None)
-        return self._prefetch_device_indices_by_reqid.pop(req_id, None)
+        agreed_len = self._global_consensus_prefetch_done.pop(req_id, None)
+        indices = self._prefetch_device_indices_by_reqid.pop(req_id, None)
+        if indices is None:
+            return None
+        if self.pp_size > 1 and agreed_len is not None and agreed_len < indices.numel():
+            # The inject path used indices[:agreed_len]. The tail
+            # indices[agreed_len:] is allocated-but-never-injected; free
+            # it now (same approach as release_aborted_request: trust
+            # CUDA stream serialization to handle the in-flight H->D copy
+            # vs. allocator-reuse race window).
+            tail = indices[agreed_len:]
+            if tail.numel() > 0:
+                self.token_to_kv_pool_allocator.free(tail)
+            return indices[:agreed_len]
+        return indices
 
     def peek_prefetch_device_indices(self, req_id: str) -> Optional[torch.Tensor]:
         """Non-destructive read of the L3 handoff for this req.
