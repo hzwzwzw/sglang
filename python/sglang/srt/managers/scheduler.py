@@ -307,6 +307,13 @@ class Scheduler(
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch: Optional[ScheduleBatch] = None
+        # Lightweight crash diag: rolling event ring + on-crash JSON dump.
+        # See SchedulerCrashDiag docstring; disable via SGLANG_CRASH_DIAG=0.
+        from sglang.srt.managers.scheduler_components.crash_diag import (
+            SchedulerCrashDiag,
+        )
+
+        self.crash_diag = SchedulerCrashDiag(pp_rank=pp_rank, tp_rank=tp_rank)
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -3914,7 +3921,17 @@ def run_scheduler_process(
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()
 
-    except Exception:
+    except Exception as exc:
+        # Dump crash diag (ring + state snapshot) BEFORE the standard
+        # logger.error path so SIGQUIT doesn't truncate the dump.
+        # Best-effort: never raises out of dump_on_crash.
+        if scheduler is not None and hasattr(scheduler, "crash_diag"):
+            try:
+                scheduler.crash_diag.dump_on_crash(
+                    scheduler, reason="scheduler_exception", exc=exc
+                )
+            except Exception:
+                pass
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)

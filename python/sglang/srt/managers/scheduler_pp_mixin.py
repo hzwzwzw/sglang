@@ -163,6 +163,88 @@ def _pp_desync_log_launch(self: "Scheduler", mb_id: int, pp_proxy_tensors) -> No
     )
 
 
+def _crash_diag_record_schedule(self: "Scheduler", mb_id: int, batch) -> None:
+    """Append a per-mb_id schedule snapshot to the crash-diag ring.
+
+    Captures the minimum needed to retrace state divergence after a
+    crash: req identities + extend lens + prefix lens, chunked_req,
+    and the consensus / handoff dict sizes. Cap reqs to 8 for size.
+    """
+    try:
+        cur = batch
+        reqs_summary = []
+        if cur is not None and hasattr(cur, "reqs"):
+            for r in cur.reqs[:8]:
+                reqs_summary.append(
+                    (
+                        r.rid[-12:],
+                        getattr(r, "extend_input_len", None),
+                        (
+                            len(r.prefix_indices)
+                            if getattr(r, "prefix_indices", None) is not None
+                            else 0
+                        ),
+                        getattr(r, "storage_hit_length", 0),
+                    )
+                )
+        tc = getattr(self, "tree_cache", None)
+        cc = getattr(tc, "cache_controller", None) if tc is not None else None
+        chunked = getattr(self, "chunked_req", None)
+        self.crash_diag.record(
+            "schedule",
+            step=getattr(self, "forward_ct", None),
+            mb_id=mb_id,
+            nreq=(len(cur.reqs) if cur is not None and hasattr(cur, "reqs") else 0),
+            ext_tok=(
+                getattr(cur, "extend_num_tokens", None) if cur is not None else None
+            ),
+            chunked_rid=(chunked.rid[-12:] if chunked is not None else None),
+            waiting=len(getattr(self, "waiting_queue", [])),
+            local_done=(len(getattr(tc, "_local_prefetch_done_rids", {})) if tc else 0),
+            global_done=(
+                len(getattr(tc, "_global_consensus_prefetch_done", {})) if tc else 0
+            ),
+            handoff_inflight=(len(getattr(tc, "_handoff_in_flight", {})) if tc else 0),
+            ack_load=(len(getattr(cc, "ack_load_queue", [])) if cc else 0),
+            ack_write=(len(getattr(cc, "ack_write_queue", [])) if cc else 0),
+            ongoing_load_back=(len(getattr(tc, "ongoing_load_back", {})) if tc else 0),
+            ongoing_write_through=(
+                len(getattr(tc, "ongoing_write_through", {})) if tc else 0
+            ),
+            reqs=reqs_summary,
+        )
+    except Exception:  # noqa: BLE001 — diag must never crash scheduler
+        pass
+
+
+def _crash_diag_record_launch(self: "Scheduler", mb_id: int, pp_proxy_tensors) -> None:
+    """Append a per-mb_id launch snapshot to the crash-diag ring.
+
+    Records the local cur_ext and the IPC hidden_states shape so the
+    cur_ext != ipc_hs[0] crash class is directly visible in the dump.
+    """
+    try:
+        cur = self.cur_batch
+        if cur is None:
+            return
+        ipc_hs_shape = None
+        if pp_proxy_tensors is not None:
+            try:
+                ipc_hs_shape = tuple(pp_proxy_tensors["hidden_states"].shape)
+            except (KeyError, AttributeError):
+                ipc_hs_shape = None
+        self.crash_diag.record(
+            "launch",
+            step=getattr(self, "forward_ct", None),
+            mb_id=mb_id,
+            cur_ext=getattr(cur, "extend_num_tokens", None),
+            nreq=len(cur.reqs) if hasattr(cur, "reqs") else 0,
+            ipc_hs=ipc_hs_shape,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -393,6 +475,12 @@ class SchedulerPPMixin:
                 batch = self.get_new_batch_prefill()
                 if _PP_DESYNC_DIAG:
                     _pp_desync_log_schedule(self, mb_id, batch)
+                # Crash-diag ring: record minimal per-mb_id schedule state
+                # so a later crash dump shows the last few seconds of
+                # batch composition + chunked_req identity. Tiny ~150 us
+                # cost per mb_id; bounded by the deque's maxlen.
+                if self.crash_diag.enabled:
+                    _crash_diag_record_schedule(self, mb_id, batch)
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
@@ -1559,6 +1647,8 @@ class SchedulerPPMixin:
     ):
         if _PP_DESYNC_DIAG:
             _pp_desync_log_launch(self, mb_id, pp_proxy_tensors)
+        if self.crash_diag.enabled:
+            _crash_diag_record_launch(self, mb_id, pp_proxy_tensors)
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
