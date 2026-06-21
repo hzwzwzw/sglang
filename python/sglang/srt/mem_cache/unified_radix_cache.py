@@ -2746,36 +2746,33 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Every rank must enter the all_reduce below; ongoing_write_through can
         # diverge across ranks (e.g. write_backup returning 0 on a subset).
-        #
-        # CRITICAL: every rank must compute its OWN finish_count from its
-        # local ack_write_queue, and we must take the actual PP-MIN.
-        # Pre-fix: only pp_rank==0 computed finish_count; ``_all_reduce``
-        # then broadcasts pp0's value to all PP ranks (its TP reduce-op
-        # only applies within pp0's TP group). When pp0 had more ready
-        # entries than another PP rank had queued, that rank would
-        # ``pop(0)`` from an empty list and crash. The queues legitimately
-        # diverge in length because write_backup completion timing is
-        # per-rank, not lockstep across PP.
         finish_count = 0
-        for _, finish_event, _ in cc.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        if self.pp_rank == 0:
+            for _, finish_event, ack_list in cc.ack_write_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
 
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        # Step 1: TP-MIN within each PP rank's attn group.
-        self._all_reduce_attn_groups(
-            finish_count_tensor, torch.distributed.ReduceOp.MIN
-        )
-        # Step 2: PP-MIN across PP ranks. Without this, ranks pop
-        # different counts and drift (or crash, as observed).
-        if self.pp_size > 1 and self.pp_group is not None:
-            torch.distributed.all_reduce(
-                finish_count_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.pp_group,
-            )
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
+
+        # Defensive cap: pp0 broadcasts its own ready count, but each
+        # rank's ack_write_queue length can be SHORTER than pp0's
+        # (write_backup completion is per-rank). Without this cap, ranks
+        # whose queue is shorter than pp0's would ``pop(0)`` from an
+        # empty list and crash (observed in pp1 dump 1782044335186:
+        # IndexError pop from empty list at writing_check:2750).
+        #
+        # A real PP-MIN collective here would deadlock during warmup:
+        # PP-stagger means ranks reach writing_check at different
+        # wall-clock moments and may have different call counts during
+        # warmup; ``torch.distributed.all_reduce`` requires every rank
+        # to enter together. The original P2P chain in ``_pp_sync``
+        # works under stagger but only carries pp0's value, hence this
+        # local cap. Per-rank divergence in pop count is already
+        # acknowledged by the comment at the top of this block.
+        finish_count = min(finish_count, len(cc.ack_write_queue))
 
         # Process completed acks
         while finish_count > 0:
