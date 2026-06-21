@@ -128,10 +128,54 @@ class SchedulerCrashDiag:
                     "_global_consensus_prefetch_done",
                     "_prefetch_device_indices_by_reqid",
                     "prefetch_loaded_tokens_by_reqid",
+                    "_pending_pop_indices",
+                    "_consumed_l3_handoff_rids",
+                    "evictable_device_leaves",
+                    "evictable_host_leaves",
                 ):
                     val = getattr(tc, attr, None)
                     if val is not None:
                         s[attr] = len(val)
+                # Per-component evictable/protected sizes — useful to
+                # spot per-rank pool-pressure asymmetry that might be
+                # driving eviction divergence.
+                for attr in (
+                    "component_evictable_size_",
+                    "component_protected_size_",
+                ):
+                    val = getattr(tc, attr, None)
+                    if isinstance(val, dict):
+                        s[attr] = {
+                            (k.name if hasattr(k, "name") else str(k)): v
+                            for k, v in val.items()
+                        }
+                # Pool free-pages snapshot. The allocator API varies
+                # (HiSparse wraps multiple inner allocators), so probe
+                # a few common attrs and return whatever's there.
+                allocator = getattr(tc, "token_to_kv_pool_allocator", None)
+                if allocator is not None:
+                    for attr in ("available_size", "size", "free_pages"):
+                        try:
+                            getter = getattr(allocator, attr, None)
+                            if callable(getter):
+                                s[f"allocator_{attr}"] = int(getter())
+                            elif getter is not None:
+                                s[f"allocator_{attr}"] = (
+                                    int(getter)
+                                    if isinstance(getter, (int, float))
+                                    else len(getter)
+                                )
+                        except Exception:
+                            pass
+                    inner = getattr(allocator, "logical_attn_allocator", None)
+                    if inner is not None:
+                        for attr in ("available_size", "size"):
+                            try:
+                                getter = getattr(inner, attr, None)
+                                if callable(getter):
+                                    s[f"swa_allocator_{attr}"] = int(getter())
+                            except Exception:
+                                pass
                 # Sample rids for the cross-rank diffable dicts.
                 for attr in (
                     "_local_prefetch_done_rids",

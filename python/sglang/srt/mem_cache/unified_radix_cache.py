@@ -772,6 +772,22 @@ class UnifiedRadixCache(BasePrefixCache):
 
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+
+            # Record tree-write for crash_diag ring (best-effort, never raises).
+            # This lets cross-rank dump diff pinpoint the first rank to write
+            # a divergent prefix length for a given rid.
+            rec = getattr(self, "_tree_event_recorder", None)
+            if rec is not None:
+                try:
+                    rec.record(
+                        "tree_finished_insert",
+                        rid=req.rid[-12:],
+                        page_aligned_len=page_aligned_len,
+                        prev_prefix_len=insert_params.prev_prefix_len,
+                        result_prefix_len=getattr(result, "prefix_len", None),
+                    )
+                except Exception:
+                    pass
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
@@ -841,6 +857,23 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.key = radix_key
         insert_params.value = values
         result = self.insert(insert_params)
+
+        # Record tree-write for crash_diag ring (best-effort, never raises).
+        # Captures the first divergence point when ranks insert different
+        # prefix lengths for the same rid.
+        rec = getattr(self, "_tree_event_recorder", None)
+        if rec is not None:
+            try:
+                rec.record(
+                    "tree_unfinished_insert",
+                    rid=req.rid[-12:],
+                    page_aligned_len=page_aligned_len,
+                    prev_prefix_len=insert_params.prev_prefix_len,
+                    result_prefix_len=getattr(result, "prefix_len", None),
+                    chunked=chunked,
+                )
+            except Exception:
+                pass
 
         # return_full_match: repoint by full full-attention residency, not the
         # SWA-window-safe match. A reused decode-worker prefix can be fully

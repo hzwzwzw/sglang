@@ -462,6 +462,15 @@ class Scheduler(
         self._tree_cache_supports_l3_handoff = hasattr(
             self.tree_cache, "peek_prefetch_device_indices"
         )
+        # Wire the crash_diag ring as a tree-write event recorder so
+        # cache_unfinished_req / cache_finished_req calls land in the
+        # rolling event buffer. Used to pinpoint cross-rank tree-state
+        # divergence (different ranks inserting different prefix lengths
+        # for the same rid).
+        try:
+            self.tree_cache._tree_event_recorder = self.crash_diag
+        except Exception:
+            pass
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
