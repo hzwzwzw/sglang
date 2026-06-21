@@ -417,16 +417,36 @@ class SchedulerPPMixin:
         pmbs: List[Optional[Dict[str, int]]] = [None] * self.pp_loop_size
         consensus_prefetch_done_rids: Optional[Dict[str, int]] = None
         if l3_consensus_ring_enabled:
+            # Configure deferred-pop grace: cover the worst-case ring
+            # rotation between PHASE A (local-done contributed) and
+            # PHASE B (consensus arrives back) so the dict entry stays
+            # alive across the entire window. 2 * pp_loop_size mb_ids is
+            # a safe upper bound (one full pipeline length each way + slack).
+            try:
+                self.tree_cache._pending_pop_grace = max(
+                    self.tree_cache._pending_pop_grace,
+                    2 * self.pp_loop_size,
+                )
+            except AttributeError:
+                pass
             logger.info(
                 "[hicache] L3 prefetch-done consensus ring enabled (pp_size=%d, pp_loop_size=%d). "
-                "Per-req L3 inject is gated on full-PP consensus to prevent IPC shape mismatch.",
+                "Per-req L3 inject is gated on full-PP consensus to prevent IPC shape mismatch. "
+                "Deferred-pop grace=%d mb_ids.",
                 self.ps.pp_size,
                 self.pp_loop_size,
+                getattr(self.tree_cache, "_pending_pop_grace", 0),
             )
 
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                # Tick the deferred-pop drain once per mb_id. Removes
+                # staged _prefetch_device_indices_by_reqid entries whose
+                # PHASE-A->PHASE-B grace window has fully elapsed.
+                # No-op when L3 ring is disabled (deque always empty).
+                if l3_consensus_ring_enabled:
+                    self.tree_cache.drain_pending_pop_indices()
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -557,25 +577,29 @@ class SchedulerPPMixin:
                     if l3_consensus_ring_enabled:
                         next_consensus_bootstrapped_rids, next_l3_payload = raw
                         # Apply L3 consensus immediately so the NEXT
-                        # add_one_req sees admitted rids. Filter dead rids
-                        # whose handoff slots were already freed locally
-                        # (req aborted between PHASE A and PHASE B).
+                        # add_one_req sees admitted rids.
+                        #
+                        # apply_l3_consensus updates _global_consensus_prefetch_done
+                        # AND truncates each rid's device-indices tensor to
+                        # the PP-MIN agreed_len (freeing the unused tail).
+                        # Rids absent from local indices (defensive against
+                        # the abort case) are silently skipped.
+                        #
+                        # With deferred-pop (A1) in place, admit-time pop no
+                        # longer removes the dict entry inside the PHASE-A
+                        # to PHASE-B window, so the previously-broken
+                        # admission-driven divergence path is closed.
                         if next_l3_payload:
                             tc = self.tree_cache
-                            live = {
-                                rid: agreed_len
-                                for rid, agreed_len in next_l3_payload.items()
-                                if rid in tc._prefetch_device_indices_by_reqid
-                            }
-                            tc._global_consensus_prefetch_done.update(live)
+                            n_applied = tc.apply_l3_consensus(next_l3_payload)
                             next_consensus_prefetch_done_rids = next_l3_payload
-                            if _PP_DESYNC_DIAG and live:
+                            if _PP_DESYNC_DIAG and n_applied:
                                 logger.info(
                                     "[hicache] L3 consensus admit pp=%d mb=%d "
-                                    "n_live=%d n_recv=%d global=%d local=%d",
+                                    "n_applied=%d n_recv=%d global=%d local=%d",
                                     self.ps.pp_rank,
                                     mb_id,
-                                    len(live),
+                                    n_applied,
                                     len(next_l3_payload),
                                     len(tc._global_consensus_prefetch_done),
                                     len(tc._local_prefetch_done_rids),

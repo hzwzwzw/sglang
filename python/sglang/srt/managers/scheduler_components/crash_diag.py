@@ -33,6 +33,7 @@ import collections
 import json
 import logging
 import os
+import signal
 import time
 import traceback
 from typing import Any, Dict, Optional
@@ -214,3 +215,82 @@ class SchedulerCrashDiag:
         except Exception as e:  # noqa: BLE001
             logger.error("[crash_diag] failed to dump state: %r", e)
             return None
+
+
+def install_signal_handlers(scheduler: Any) -> None:
+    """Install SIGUSR1/SIGTERM handlers so siblings dump when the crashing
+    rank broadcasts (see ``broadcast_sibling_dump``).
+
+    SIGKILL is uncatchable, so we cannot rely on the parent's
+    ``kill_process_tree`` path: when one rank raises and SIGQUITs the
+    parent, the parent's launch_phase_sigquit_handler runs
+    ``kill_process_tree`` which sends SIGKILL to every child. Sibling
+    ranks (typically blocked on PP IPC recv) get SIGKILL before any
+    Python handler can run.
+
+    The crashing rank broadcasts SIGUSR1 to siblings BEFORE SIGQUITing
+    parent and sleeps briefly; siblings catch SIGUSR1, dump, then get
+    SIGKILL'd by parent moments later.
+
+    SIGTERM is also caught for the rare case parent uses .terminate()
+    instead of .kill().
+    """
+    diag = getattr(scheduler, "crash_diag", None)
+    if diag is None or not diag.enabled:
+        return
+
+    def _handler(signum, frame):
+        try:
+            sig_name = signal.Signals(signum).name
+        except Exception:
+            sig_name = str(signum)
+        try:
+            diag.dump_on_crash(scheduler, reason=f"signal_{sig_name}")
+        except Exception as e:  # noqa: BLE001
+            logger.error("[crash_diag] sibling dump failed on %s: %r", sig_name, e)
+        # Don't re-raise: the parent will SIGKILL us shortly. If somehow
+        # not, returning lets the main loop continue (better than
+        # killing ourselves and hiding the real crash on another rank).
+
+    for sig in (signal.SIGUSR1, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[crash_diag] failed to install handler for %s: %r", sig, e)
+
+
+def broadcast_sibling_dump(grace_seconds: float = 1.5) -> int:
+    """Send SIGUSR1 to every sibling process under the same parent so they
+    each dump their crash_diag state. Returns count of signals sent.
+
+    Called by the crashing scheduler BEFORE it SIGQUITs the parent. The
+    parent's SIGQUIT handler immediately runs kill_process_tree which
+    SIGKILLs siblings -- without this prior broadcast they never get to
+    dump. The grace_seconds sleep gives siblings time to finish writing
+    their JSON before SIGKILL hits.
+
+    Best-effort: psutil errors, missing parents, dead siblings are all
+    swallowed. Never raises.
+    """
+    n_signaled = 0
+    try:
+        import psutil
+
+        me = psutil.Process()
+        parent = me.parent()
+        if parent is None:
+            return 0
+        my_pid = me.pid
+        for sib in parent.children(recursive=True):
+            if sib.pid == my_pid:
+                continue
+            try:
+                sib.send_signal(signal.SIGUSR1)
+                n_signaled += 1
+            except Exception:  # noqa: BLE001
+                pass
+        if n_signaled > 0 and grace_seconds > 0:
+            time.sleep(grace_seconds)
+    except Exception as e:  # noqa: BLE001
+        logger.error("[crash_diag] broadcast_sibling_dump failed: %r", e)
+    return n_signaled

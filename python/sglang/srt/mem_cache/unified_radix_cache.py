@@ -4,7 +4,7 @@ import logging
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from functools import partial
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Iterator, Optional, TypeVar
@@ -458,6 +458,42 @@ class UnifiedRadixCache(BasePrefixCache):
         # empty -> peek always returns None -> equivalent to L3 disabled.
         self._local_prefetch_done_rids: dict[str, int] = {}
         self._global_consensus_prefetch_done: dict[str, int] = {}
+        # Staging deque for deferred removal of _prefetch_device_indices_by_reqid
+        # entries. Each entry: (drain_marker, rid, indices_or_None).
+        #
+        # WHY this exists: the PP-consensus ring has an inherent skew --
+        # rank R contributes its local-done set in PHASE A at ring iter
+        # T_A, but receives the consensus back in PHASE B at iter
+        # T_A + (pp_size - R + last_rank). If R pops indices between
+        # T_A and T_B (admission of the rid in some intermediate mb_id),
+        # the live filter at PHASE B silently drops the rid -> R doesn't
+        # inject -> other ranks (which received PHASE B earlier or later
+        # with indices still alive) DO inject -> per-rank inject set
+        # diverges -> cache_finished_req writes different prefix lengths
+        # to each rank's tree -> tree match length diverges over time
+        # -> IPC shape mismatch crash.
+        #
+        # Fix: keep _prefetch_device_indices_by_reqid[rid] alive for one
+        # full ring rotation after pop is requested, so PHASE B always
+        # sees the entry and the live filter never drops anything.
+        # Actual deletion happens via drain_pending_pop_indices() invoked
+        # at every mb_id step. The grace window is pp_size * 2 mb_ids
+        # (conservative; worst-case ring traversal is < pp_size * 2).
+        self._pending_pop_indices: "deque[tuple[int, str, Optional[torch.Tensor]]]" = (
+            deque()
+        )
+        # Monotonic counter incremented each call to drain_pending_pop_indices.
+        # Used as the "marker" stamped onto staged entries; entries are
+        # actually removed when current_marker - staged_marker >= grace.
+        self._pending_pop_drain_marker: int = 0
+        # Resolved once PP size is known (via setup hook from scheduler).
+        # Default 16 covers worst-case for pp_size=8 with safety margin.
+        self._pending_pop_grace: int = 16
+        # Rids whose handoff indices have been transferred to a req via
+        # ``pop_prefetch_device_indices`` (admit). Used by
+        # ``release_aborted_request`` to know not to double-free slots that
+        # are now owned by an in-flight req.
+        self._consumed_l3_handoff_rids: set[str] = set()
         self.ongoing_prefetch: dict[
             str,
             tuple[
@@ -2249,7 +2285,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
-    def pop_prefetch_device_indices(self, req_id: str) -> Optional[torch.Tensor]:
+    def pop_prefetch_device_indices(
+        self, req_id: str, consumed: bool = True
+    ) -> Optional[torch.Tensor]:
         """Pop the device-indices handoff produced by ``check_prefetch_progress``.
 
         The scheduler calls this after ``add_one_req`` returns CONTINUE to
@@ -2260,35 +2298,46 @@ class UnifiedRadixCache(BasePrefixCache):
         Returns ``None`` if no handoff was produced (e.g., 0 hit, device
         alloc failure, or prefetch wasn't issued).
 
-        When length-consensus truncation applies (pp_size>1 and
-        ``_global_consensus_prefetch_done`` has a smaller length than this
-        rank's local tensor), this method **frees the unused tail** so it
-        doesn't leak. Without this, ranks whose local effective_hit_tokens
-        exceeded the PP-MIN would alloc more slots than they ever inject;
-        cache_finished_req only writes prefix_indices (the truncated
-        head) to the radix tree, so the tail is invisible to eviction
-        and stays allocated forever -- exactly the 1-page leak observed
-        in long-context workloads where mooncake completion times are
-        more spread across PP ranks.
+        ``consumed`` parameter: pass ``True`` (default) when inject actually
+        happened (slots are owned by req.prefix_indices) -- pop defers dict
+        removal so PHASE-B live-filter on this rank stays consistent. Pass
+        ``False`` when inject didn't happen (peek/pop race: peek returned
+        None, but consensus arrived between peek and pop and pop sees
+        indices) -- caller will free the slots, so we pop immediately and
+        do NOT defer (otherwise apply_l3_consensus might double-free the
+        tail when truncating).
+
+        DEFERRED-DELETE design (A1): in the consumed=True path, the dict
+        entry in ``_prefetch_device_indices_by_reqid`` is NOT removed
+        here -- it is staged for deferred removal via
+        ``drain_pending_pop_indices`` after ``_pending_pop_grace`` mb_id
+        ticks. This keeps the entry visible to PHASE B "live filter"
+        applications on this and other ranks for a full ring rotation.
+
+        Tail truncation (when local effective_hit_tokens > PP-MIN
+        agreed_len) happens at consensus-apply time in
+        ``apply_l3_consensus``, NOT here -- so the dict already holds the
+        agreed-length tensor.
         """
-        # Cleanup the consensus tracking dicts. Even if the rid wasn't yet
-        # in the global consensus (peek would have returned None and we
-        # shouldn't be here), draining keeps the dicts bounded.
+        # Pop the consensus tracking dicts immediately. They're scoped to
+        # one consensus round; once admit consumes the rid, no future
+        # peek/pop should re-find it.
         self._local_prefetch_done_rids.pop(req_id, None)
-        agreed_len = self._global_consensus_prefetch_done.pop(req_id, None)
-        indices = self._prefetch_device_indices_by_reqid.pop(req_id, None)
+        self._global_consensus_prefetch_done.pop(req_id, None)
+        if not consumed:
+            # Caller-owned cleanup path: pop the dict entry now so
+            # apply_l3_consensus cannot double-free the tail later, and
+            # do NOT mark consumed (caller will free, no req owns slots).
+            return self._prefetch_device_indices_by_reqid.pop(req_id, None)
+        indices = self._prefetch_device_indices_by_reqid.get(req_id)
         if indices is None:
             return None
-        if self.pp_size > 1 and agreed_len is not None and agreed_len < indices.numel():
-            # The inject path used indices[:agreed_len]. The tail
-            # indices[agreed_len:] is allocated-but-never-injected; free
-            # it now (same approach as release_aborted_request: trust
-            # CUDA stream serialization to handle the in-flight H->D copy
-            # vs. allocator-reuse race window).
-            tail = indices[agreed_len:]
-            if tail.numel() > 0:
-                self.token_to_kv_pool_allocator.free(tail)
-            return indices[:agreed_len]
+        # Mark consumed so abort path knows not to free.
+        self._consumed_l3_handoff_rids.add(req_id)
+        # Stage for deferred dict removal. The third element is None
+        # because slots are now owned by the req -- no free needed when
+        # the staged entry expires.
+        self._pending_pop_indices.append((self._pending_pop_drain_marker, req_id, None))
         return indices
 
     def peek_prefetch_device_indices(self, req_id: str) -> Optional[torch.Tensor]:
@@ -2296,37 +2345,98 @@ class UnifiedRadixCache(BasePrefixCache):
 
         Used by the scheduler to inject device indices into ``req.prefix_indices``
         before calling ``add_one_req``. The actual ``pop`` happens only after
-        ``add_one_req`` returns CONTINUE — so a NO_TOKEN-rejected req can be
+        ``add_one_req`` returns CONTINUE -- so a NO_TOKEN-rejected req can be
         re-tried on the next scheduling iteration without losing its L3 slots.
 
-        For pp_size>1, the rid must be in ``_global_consensus_prefetch_done``
-        AND we truncate the device-indices tensor to the agreed length.
-        Each PP rank may have observed a different ``effective_hit_tokens``
-        from mooncake (TP all-reduce only TP-syncs, not PP-syncs); without
-        truncating to the global MIN, ranks would inject different #tokens
-        and IPC shapes would diverge. The agreed length is computed by the
-        ring as MIN over all ranks' local lengths.
+        For pp_size>1, the rid must be in ``_global_consensus_prefetch_done``;
+        truncation to the PP-agreed length already happened in
+        ``apply_l3_consensus`` so the dict tensor is exactly agreed_len.
         """
         if self.pp_size > 1:
-            agreed_len = self._global_consensus_prefetch_done.get(req_id)
-            if agreed_len is None:
+            if req_id not in self._global_consensus_prefetch_done:
                 return None
-            indices = self._prefetch_device_indices_by_reqid.get(req_id)
-            if indices is None:
-                return None
-            # Truncate to the PP-agreed length so every rank injects the
-            # same #tokens. agreed_len <= local length by construction
-            # (ring takes MIN), so this is always a valid slice.
-            if agreed_len < indices.numel():
-                return indices[:agreed_len]
-            return indices
         return self._prefetch_device_indices_by_reqid.get(req_id)
+
+    def apply_l3_consensus(self, payload: dict) -> int:
+        """Apply a PHASE-B L3 prefetch-done consensus payload.
+
+        ``payload`` is rid -> agreed_len (PP-MIN of effective_hit_tokens).
+        For each rid we still have indices for, truncate to agreed_len
+        (free the tail) and record the consensus. Rids with no local
+        indices are skipped -- this is the "live filter" preserved as
+        defense against the abort case (a rid that aborted locally is
+        already gone from indices dict; consensus from the ring still
+        carries it transiently). With deferred-pop (A1) in place, the
+        admission case never triggers the filter.
+
+        Returns the number of rids actually applied.
+        """
+        n_applied = 0
+        for rid, agreed_len in payload.items():
+            indices = self._prefetch_device_indices_by_reqid.get(rid)
+            if indices is None:
+                continue
+            if agreed_len < indices.numel():
+                tail = indices[agreed_len:]
+                if tail.numel() > 0:
+                    self.token_to_kv_pool_allocator.free(tail)
+                self._prefetch_device_indices_by_reqid[rid] = indices[:agreed_len]
+            self._global_consensus_prefetch_done[rid] = agreed_len
+            n_applied += 1
+        return n_applied
+
+    def drain_pending_pop_indices(self) -> int:
+        """Tick the deferred-pop drain.
+
+        Increments the monotonic marker and removes any staged entries
+        whose age has reached ``_pending_pop_grace``. For admit-staged
+        entries (third tuple field is None), just remove the dict entry
+        -- slots are owned by the req. For abort-staged entries (third
+        field is a tensor), free the slots back to the allocator before
+        removing the dict entry.
+
+        Returns the number of entries actually drained this tick.
+        """
+        self._pending_pop_drain_marker += 1
+        cur = self._pending_pop_drain_marker
+        grace = self._pending_pop_grace
+        n_drained = 0
+        while self._pending_pop_indices:
+            mark, rid, abort_tensor = self._pending_pop_indices[0]
+            if cur - mark < grace:
+                break
+            self._pending_pop_indices.popleft()
+            self._prefetch_device_indices_by_reqid.pop(rid, None)
+            self._consumed_l3_handoff_rids.discard(rid)
+            if abort_tensor is not None and abort_tensor.numel() > 0:
+                try:
+                    self.token_to_kv_pool_allocator.free(abort_tensor)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[hicache] drain abort-free failed for rid=%s: %r", rid, e
+                    )
+            n_drained += 1
+        return n_drained
 
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         # Free any device-indices that were handed off but never consumed
         # (e.g., prefetch finished, scheduler hadn't picked the req up
         # yet, then req aborted). Without this, the device slots leak.
+        # If the rid was already admitted (handed off to a req via
+        # ``pop_prefetch_device_indices``), the slots are owned by that
+        # req's prefix_indices/req_to_token chain -- free path runs
+        # through cache_finished_req on completion. Do NOT free here
+        # (would double-free). The dict entry is still alive (deferred
+        # removal); leave it for the drain to clean up so PHASE-B live
+        # filter on this rank stays consistent for the remaining grace
+        # window. We only need to drop the consensus-tracking entries
+        # so this rid won't be considered for re-injection.
+        if rid in self._consumed_l3_handoff_rids:
+            self._local_prefetch_done_rids.pop(rid, None)
+            self._global_consensus_prefetch_done.pop(rid, None)
+            # Leave _prefetch_device_indices_by_reqid[rid] for drain.
+            return
         leftover = self._prefetch_device_indices_by_reqid.pop(rid, None)
         # Drop consensus tracking entries for this rid; PP ring will not
         # forward consensus on a rid that has dropped out of any rank's

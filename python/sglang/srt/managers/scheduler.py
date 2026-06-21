@@ -2620,11 +2620,20 @@ class Scheduler(
                 and self.enable_hicache_storage
                 and self._tree_cache_supports_l3_handoff
             ):
-                leftover_l3 = self.tree_cache.pop_prefetch_device_indices(req.rid)
+                # consumed=True when inject happened (slots owned by req);
+                # consumed=False when inject didn't happen (peek/pop race
+                # — pop sees indices that consensus arrived for between
+                # peek and pop, but they were never injected, so the
+                # caller frees them and we must NOT defer the dict
+                # removal (otherwise apply_l3_consensus could double-free).
+                inject_happened = l3_dev is not None and l3_dev.numel() > 0
+                leftover_l3 = self.tree_cache.pop_prefetch_device_indices(
+                    req.rid, consumed=inject_happened
+                )
                 if (
                     leftover_l3 is not None
                     and leftover_l3.numel() > 0
-                    and (l3_dev is None or l3_dev.numel() == 0)
+                    and not inject_happened
                 ):
                     self.token_to_kv_pool_allocator.free(leftover_l3)
 
@@ -3918,6 +3927,17 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
+        # Install signal handlers so siblings can dump on SIGUSR1
+        # broadcast (sent below before SIGQUIT-to-parent path).
+        try:
+            from sglang.srt.managers.scheduler_components.crash_diag import (
+                install_signal_handlers,
+            )
+
+            install_signal_handlers(scheduler)
+        except Exception:
+            pass
+
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()
 
@@ -3932,6 +3952,18 @@ def run_scheduler_process(
                 )
             except Exception:
                 pass
+        # Broadcast SIGUSR1 to siblings so they each dump too. Parent's
+        # SIGQUIT handler will SIGKILL them moments after we send SIGQUIT
+        # below; without this prior broadcast they never dump. The
+        # function sleeps a short grace window inside.
+        try:
+            from sglang.srt.managers.scheduler_components.crash_diag import (
+                broadcast_sibling_dump,
+            )
+
+            broadcast_sibling_dump()
+        except Exception:
+            pass
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
