@@ -2402,10 +2402,22 @@ class UnifiedRadixCache(BasePrefixCache):
         carries it transiently). With deferred-pop (A1) in place, the
         admission case never triggers the filter.
 
+        Rids already admitted (in ``_consumed_l3_handoff_rids``) are
+        also skipped: a PHASE B payload can carry a rid that this rank
+        admitted before the payload arrived (the upstream PHASE A
+        intersect captured _local_done before pop). Without this guard,
+        we'd re-set _global_consensus[rid] for an admitted rid; drain
+        only removes the indices entry, leaving the consensus dict
+        with an orphaned key forever (observed in pp1 dump:
+        _global_consensus_prefetch_done=5 while local_done=0,
+        indices=0, consumed=0).
+
         Returns the number of rids actually applied.
         """
         n_applied = 0
         for rid, agreed_len in payload.items():
+            if rid in self._consumed_l3_handoff_rids:
+                continue
             indices = self._prefetch_device_indices_by_reqid.get(rid)
             if indices is None:
                 continue
@@ -2734,15 +2746,35 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Every rank must enter the all_reduce below; ongoing_write_through can
         # diverge across ranks (e.g. write_backup returning 0 on a subset).
+        #
+        # CRITICAL: every rank must compute its OWN finish_count from its
+        # local ack_write_queue, and we must take the actual PP-MIN.
+        # Pre-fix: only pp_rank==0 computed finish_count; ``_all_reduce``
+        # then broadcasts pp0's value to all PP ranks (its TP reduce-op
+        # only applies within pp0's TP group). When pp0 had more ready
+        # entries than another PP rank had queued, that rank would
+        # ``pop(0)`` from an empty list and crash. The queues legitimately
+        # diverge in length because write_backup completion timing is
+        # per-rank, not lockstep across PP.
         finish_count = 0
-        if self.pp_rank == 0:
-            for _, finish_event, ack_list in cc.ack_write_queue:
-                if not finish_event.query():
-                    break
-                finish_count += 1
+        for _, finish_event, _ in cc.ack_write_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
 
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        # Step 1: TP-MIN within each PP rank's attn group.
+        self._all_reduce_attn_groups(
+            finish_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        # Step 2: PP-MIN across PP ranks. Without this, ranks pop
+        # different counts and drift (or crash, as observed).
+        if self.pp_size > 1 and self.pp_group is not None:
+            torch.distributed.all_reduce(
+                finish_count_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.pp_group,
+            )
         finish_count = finish_count_tensor.item()
 
         # Process completed acks
