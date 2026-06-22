@@ -798,6 +798,29 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
                 except Exception:
                     pass
+            # Per-rank disk log: token-content hash so cross-rank diff
+            # can verify "same content -> same insert depth".
+            try:
+                from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                    get_logger as _pp_admit_get_logger,
+                )
+                from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                    hash_token_ids as _pp_admit_hash,
+                )
+
+                _diag = _pp_admit_get_logger()
+                if _diag is not None and _diag.enabled:
+                    _diag.log(
+                        "TREE_INSERT",
+                        kind="finished",
+                        rid=req.rid[-12:],
+                        palen=page_aligned_len,
+                        prev=insert_params.prev_prefix_len,
+                        result=getattr(result, "prefix_len", None),
+                        token_hash=_pp_admit_hash(token_ids, take=4096),
+                    )
+            except Exception:
+                pass
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
@@ -884,6 +907,31 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             except Exception:
                 pass
+        # Per-rank disk log
+        try:
+            from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                get_logger as _pp_admit_get_logger,
+            )
+            from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                hash_token_ids as _pp_admit_hash,
+            )
+
+            _diag = _pp_admit_get_logger()
+            if _diag is not None and _diag.enabled:
+                _diag.log(
+                    "TREE_INSERT",
+                    kind="unfinished",
+                    rid=req.rid[-12:],
+                    palen=page_aligned_len,
+                    prev=insert_params.prev_prefix_len,
+                    result=getattr(result, "prefix_len", None),
+                    chunked=chunked,
+                    token_hash=_pp_admit_hash(
+                        token_ids[:effective_cache_len], take=4096
+                    ),
+                )
+        except Exception:
+            pass
 
         # return_full_match: repoint by full full-attention residency, not the
         # SWA-window-safe match. A reused decode-worker prefix can be fully

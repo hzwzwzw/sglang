@@ -314,6 +314,16 @@ class Scheduler(
         )
 
         self.crash_diag = SchedulerCrashDiag(pp_rank=pp_rank, tp_rank=tp_rank)
+        # Per-rank disk logger for admit-time consensus debugging
+        # (SGLANG_PP_ADMIT_DIAG=1 to enable). No-op when disabled.
+        try:
+            from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                init_logger as _pp_admit_init_logger,
+            )
+
+            _pp_admit_init_logger(pp_rank=pp_rank, tp_rank=tp_rank)
+        except Exception:
+            pass
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -2570,12 +2580,34 @@ class Scheduler(
             # from the agreed dict.
             if self.enable_hicache_storage and self._tree_cache_supports_l3_handoff:
                 agreed_tree_len = self.tree_cache.peek_agreed_tree_match_len(req.rid)
+                local_match_len = len(req.prefix_indices)
+                # Per-rank log: capture each admit decision so cross-rank
+                # diff pinpoints the rid where decisions diverge.
+                try:
+                    from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                        get_logger as _pp_admit_get_logger,
+                    )
+                    from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                        short_rid as _pp_admit_short_rid,
+                    )
+
+                    _diag = _pp_admit_get_logger()
+                except Exception:
+                    _diag = None
                 if agreed_tree_len is None:
+                    if _diag is not None and _diag.enabled:
+                        _diag.log(
+                            "ADMIT_DECISION",
+                            step=getattr(self, "forward_ct", None),
+                            rid=_pp_admit_short_rid(req.rid),
+                            local_len=local_match_len,
+                            agreed_len="None",
+                            action="defer",
+                        )
                     # No consensus yet -- skip this rid this mb_id;
                     # init_next_round_input was idempotent so re-running
                     # next mb_id is fine.
                     continue
-                local_match_len = len(req.prefix_indices)
                 if agreed_tree_len < local_match_len:
                     # Truncate to the agreed length. Slots in
                     # prefix_indices[agreed_tree_len:] stay in the tree
@@ -2593,6 +2625,17 @@ class Scheduler(
                         req.host_hit_length = agreed_tree_len
                     req.set_extend_input_len(
                         len(req.fill_ids) - len(req.prefix_indices)
+                    )
+                if _diag is not None and _diag.enabled:
+                    _diag.log(
+                        "ADMIT_DECISION",
+                        step=getattr(self, "forward_ct", None),
+                        rid=_pp_admit_short_rid(req.rid),
+                        local_len=local_match_len,
+                        agreed_len=agreed_tree_len,
+                        final_prefix=len(req.prefix_indices),
+                        final_ext=req.extend_input_len,
+                        action="admit",
                     )
 
             l3_dev = None

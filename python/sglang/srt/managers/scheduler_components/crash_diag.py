@@ -67,7 +67,7 @@ class SchedulerCrashDiag:
     def __init__(self, pp_rank: int, tp_rank: int):
         self.pp_rank = pp_rank
         self.tp_rank = tp_rank
-        max_events = _env_int("SGLANG_CRASH_DIAG_RING", 1000)
+        max_events = _env_int("SGLANG_CRASH_DIAG_RING", 5000)
         self.events: "collections.deque[tuple[float, str, Dict[str, Any]]]" = (
             collections.deque(maxlen=max_events)
         )

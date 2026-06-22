@@ -634,6 +634,30 @@ class SchedulerPPMixin:
                                 # truncation is skipped.
                                 pass
                             next_consensus_tree_match_rids = next_tree_match_payload
+                            # Per-rank log: capture exactly what consensus
+                            # this rank received this mb_id so we can
+                            # diff across ranks and find the round where
+                            # values diverged for a given rid.
+                            try:
+                                from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                                    get_logger as _pp_admit_get_logger,
+                                )
+
+                                _diag = _pp_admit_get_logger()
+                                if _diag is not None and _diag.enabled:
+                                    items = list(next_tree_match_payload.items())
+                                    sample = ",".join(
+                                        f"{rid[-12:]}:{v}" for rid, v in items[:8]
+                                    )
+                                    _diag.log(
+                                        "PHASE_B_IN",
+                                        step=getattr(self, "forward_ct", None),
+                                        mb_id=mb_id,
+                                        n_tree_match=len(next_tree_match_payload),
+                                        sample=sample if sample else "empty",
+                                    )
+                            except Exception:
+                                pass
                         else:
                             next_consensus_tree_match_rids = {}
                     else:
@@ -672,6 +696,29 @@ class SchedulerPPMixin:
                             prefetch_done_rids,
                             tree_match_rids,
                         )
+                        # Per-rank log: capture exactly what tree_match
+                        # values this rank is forwarding (PHASE A
+                        # contribution + intersect output combined).
+                        try:
+                            from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                                get_logger as _pp_admit_get_logger,
+                            )
+
+                            _diag = _pp_admit_get_logger()
+                            if _diag is not None and _diag.enabled:
+                                items = list(tree_match_rids.items())
+                                sample = ",".join(
+                                    f"{rid[-12:]}:{v}" for rid, v in items[:8]
+                                )
+                                _diag.log(
+                                    "PHASE_A_OUT",
+                                    step=getattr(self, "forward_ct", None),
+                                    mb_id=mb_id,
+                                    n_tree_match=len(tree_match_rids),
+                                    sample=sample if sample else "empty",
+                                )
+                        except Exception:
+                            pass
                     else:
                         bootstrap_payload = bootstrapped_rids
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
@@ -1465,6 +1512,21 @@ class SchedulerPPMixin:
         except Exception:  # noqa: BLE001
             return {}
         result: Dict[str, int] = {}
+        # Lazy import to avoid circular; module-level guard checks env once.
+        try:
+            from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                get_logger as _pp_admit_get_logger,
+            )
+            from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                hash_token_ids as _pp_admit_hash,
+            )
+            from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                short_rid as _pp_admit_short_rid,
+            )
+
+            _diag = _pp_admit_get_logger()
+        except Exception:
+            _diag = None
         for req in wq:
             try:
                 # Skip reqs already mid-stream (prefix_indices set by a
@@ -1502,6 +1564,18 @@ class SchedulerPPMixin:
                 except AttributeError:
                     n = len(dev) if dev is not None else 0
                 result[req.rid] = int(n)
+                # Per-rank log: rid + local_match + token-content hash
+                # so cross-rank diff can verify "same content -> same
+                # match length" or pinpoint the rank that diverges.
+                if _diag is not None and _diag.enabled:
+                    _diag.log(
+                        "LOCAL_TREE_MATCH",
+                        step=getattr(self, "forward_ct", None),
+                        rid=_pp_admit_short_rid(req.rid),
+                        local_len=int(n),
+                        input_len=len(token_ids_to_match),
+                        token_hash=_pp_admit_hash(token_ids_to_match, take=4096),
+                    )
             except Exception:  # noqa: BLE001 — never break the ring
                 # On any error, omit the rid from contribution so PHASE A
                 # intersect treats it as "not present" (rid won't be in
