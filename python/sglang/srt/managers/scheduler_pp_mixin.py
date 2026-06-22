@@ -1404,10 +1404,22 @@ class SchedulerPPMixin:
                 # for tensor, len() for list. Try both defensively.
                 dev = match_result.device_indices
                 try:
-                    n = dev.numel()
+                    n_device = dev.numel()
                 except AttributeError:
-                    n = len(dev) if dev is not None else 0
-                result[req.rid] = int(n)
+                    n_device = len(dev) if dev is not None else 0
+                # CRITICAL: include host_hit_length. PrefillAdder.add_one_req
+                # calls init_load_back when host_hit_length > 0, which
+                # APPENDS host->device-loaded slots to req.prefix_indices.
+                # Without this, the consensus only constrains the device
+                # part; the host-loaded portion grows per-rank and causes
+                # IPC mismatch (observed in dump 1782138458*: pp1 admitted
+                # with prefix=1024 ext=2120 while pp0 had prefix=0
+                # ext=3144 for the SAME rid -- admit log on both showed
+                # local=0 agreed=0 final_prefix=0, then init_load_back
+                # grew pp1's prefix by 1024 host-loaded tokens).
+                n_host = int(getattr(match_result, "host_hit_length", 0) or 0)
+                n = int(n_device) + n_host
+                result[req.rid] = n
                 # Per-rank log: rid + local_match + token-content hash
                 # so cross-rank diff can verify "same content -> same
                 # match length" or pinpoint the rank that diverges.

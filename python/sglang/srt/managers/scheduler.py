@@ -2582,7 +2582,12 @@ class Scheduler(
             # from the agreed dict.
             if self.enable_hicache_storage and self._tree_cache_supports_l3_handoff:
                 agreed_tree_len = self.tree_cache.peek_agreed_tree_match_len(req.rid)
-                local_match_len = len(req.prefix_indices)
+                # Total local prefix at this moment is device-resident
+                # (in req.prefix_indices) PLUS host-resident (added later
+                # by PrefillAdder.add_one_req via init_load_back).
+                local_device_len = len(req.prefix_indices)
+                local_host_len = int(getattr(req, "host_hit_length", 0) or 0)
+                local_match_len = local_device_len + local_host_len
                 # Per-rank log: capture each admit decision so cross-rank
                 # diff pinpoints the rid where decisions diverge.
                 try:
@@ -2611,20 +2616,30 @@ class Scheduler(
                     # next mb_id is fine.
                     continue
                 if agreed_tree_len < local_match_len:
-                    # Truncate to the agreed length. Slots in
-                    # prefix_indices[agreed_tree_len:] stay in the tree
-                    # (they're tree-resident, not owned by this req),
-                    # so we do NOT free them -- just shorten the view.
-                    req.prefix_indices = req.prefix_indices[:agreed_tree_len]
-                    if req.cache_protected_len > agreed_tree_len:
-                        req.cache_protected_len = agreed_tree_len
-                    # host hits should not exceed the truncated device
-                    # prefix; cap defensively.
+                    # Truncate so total prefix (device + host-load-back)
+                    # equals agreed_tree_len. Two cases:
+                    #  (a) agreed <= device: truncate device, drop all host
+                    #  (b) agreed > device: keep device, cap host to (agreed - device)
+                    if agreed_tree_len <= local_device_len:
+                        req.prefix_indices = req.prefix_indices[:agreed_tree_len]
+                        req.host_hit_length = 0
+                        if req.cache_protected_len > agreed_tree_len:
+                            req.cache_protected_len = agreed_tree_len
+                    else:
+                        # device fully kept; cap host to fill remainder
+                        req.host_hit_length = agreed_tree_len - local_device_len
+                    # SWA / mamba host hits should never exceed the
+                    # truncated total either; cap defensively.
                     if (
-                        getattr(req, "host_hit_length", 0)
-                        and req.host_hit_length > agreed_tree_len
+                        getattr(req, "swa_host_hit_length", 0)
+                        and req.swa_host_hit_length > req.host_hit_length
                     ):
-                        req.host_hit_length = agreed_tree_len
+                        req.swa_host_hit_length = req.host_hit_length
+                    if (
+                        getattr(req, "mamba_host_hit_length", 0)
+                        and req.mamba_host_hit_length > req.host_hit_length
+                    ):
+                        req.mamba_host_hit_length = req.host_hit_length
                     req.set_extend_input_len(
                         len(req.fill_ids) - len(req.prefix_indices)
                     )
@@ -2634,8 +2649,11 @@ class Scheduler(
                         step=getattr(self, "forward_ct", None),
                         rid=_pp_admit_short_rid(req.rid),
                         local_len=local_match_len,
+                        local_device=local_device_len,
+                        local_host=local_host_len,
                         agreed_len=agreed_tree_len,
                         final_prefix=len(req.prefix_indices),
+                        final_host=int(getattr(req, "host_hit_length", 0) or 0),
                         final_ext=req.extend_input_len,
                         action="admit",
                     )
