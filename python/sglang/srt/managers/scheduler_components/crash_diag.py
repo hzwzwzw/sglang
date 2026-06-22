@@ -130,6 +130,7 @@ class SchedulerCrashDiag:
                     "prefetch_loaded_tokens_by_reqid",
                     "_pending_pop_indices",
                     "_consumed_l3_handoff_rids",
+                    "_agreed_tree_match_lens",
                     "evictable_device_leaves",
                     "evictable_host_leaves",
                 ):
@@ -180,6 +181,7 @@ class SchedulerCrashDiag:
                 for attr in (
                     "_local_prefetch_done_rids",
                     "_global_consensus_prefetch_done",
+                    "_agreed_tree_match_lens",
                 ):
                     val = getattr(tc, attr, None)
                     if val:

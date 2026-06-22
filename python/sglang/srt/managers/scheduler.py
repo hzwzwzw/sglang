@@ -2556,6 +2556,45 @@ class Scheduler(
 
             req.init_next_round_input(self.tree_cache)
 
+            # PP tree-match consensus (Plan A): truncate ``prefix_indices``
+            # to the PP-MIN length agreed via the bootstrap+L3 ring. Each
+            # rank's local match_prefix can return a different length due
+            # to per-rank tree state divergence (eviction asymmetry from
+            # per-rank L3 prefetch slot pressure -- see logs/sglang_crash
+            # _pp*_1782082* for the IPC mismatch crash this fixes).
+            #
+            # Defer admission for rids without consensus yet. Each rid
+            # is contributed to the ring at PHASE A on every mb_id while
+            # in waiting_queue; consensus arrives ~pp_loop_size mb_ids
+            # later. Once admitted (popped below), the entry is removed
+            # from the agreed dict.
+            if self.enable_hicache_storage and self._tree_cache_supports_l3_handoff:
+                agreed_tree_len = self.tree_cache.peek_agreed_tree_match_len(req.rid)
+                if agreed_tree_len is None:
+                    # No consensus yet -- skip this rid this mb_id;
+                    # init_next_round_input was idempotent so re-running
+                    # next mb_id is fine.
+                    continue
+                local_match_len = len(req.prefix_indices)
+                if agreed_tree_len < local_match_len:
+                    # Truncate to the agreed length. Slots in
+                    # prefix_indices[agreed_tree_len:] stay in the tree
+                    # (they're tree-resident, not owned by this req),
+                    # so we do NOT free them -- just shorten the view.
+                    req.prefix_indices = req.prefix_indices[:agreed_tree_len]
+                    if req.cache_protected_len > agreed_tree_len:
+                        req.cache_protected_len = agreed_tree_len
+                    # host hits should not exceed the truncated device
+                    # prefix; cap defensively.
+                    if (
+                        getattr(req, "host_hit_length", 0)
+                        and req.host_hit_length > agreed_tree_len
+                    ):
+                        req.host_hit_length = agreed_tree_len
+                    req.set_extend_input_len(
+                        len(req.fill_ids) - len(req.prefix_indices)
+                    )
+
             l3_dev = None
             if self.enable_hicache_storage and self._tree_cache_supports_l3_handoff:
                 # Per-req L3 handoff: the prefetched prefix lives in
@@ -2629,6 +2668,14 @@ class Scheduler(
                 and self.enable_hicache_storage
                 and self._tree_cache_supports_l3_handoff
             ):
+                # Drain the tree-match consensus entry so the dict stays
+                # bounded. Done here on every admit (not just inject) so
+                # rids with no L3 hit but truncated prefix also get
+                # cleaned up.
+                try:
+                    self.tree_cache.pop_agreed_tree_match_len(req.rid)
+                except AttributeError:
+                    pass
                 # consumed=True when inject happened (slots owned by req);
                 # consumed=False when inject didn't happen (peek/pop race
                 # — pop sees indices that consensus arrived for between

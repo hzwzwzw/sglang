@@ -416,6 +416,7 @@ class SchedulerPPMixin:
         )
         pmbs: List[Optional[Dict[str, int]]] = [None] * self.pp_loop_size
         consensus_prefetch_done_rids: Optional[Dict[str, int]] = None
+        consensus_tree_match_rids: Optional[Dict[str, int]] = None
         if l3_consensus_ring_enabled:
             # Configure deferred-pop grace: cover the worst-case ring
             # rotation between PHASE A (local-done contributed) and
@@ -456,6 +457,7 @@ class SchedulerPPMixin:
                 next_release_rids = None
                 next_consensus_bootstrapped_rids = None
                 next_consensus_prefetch_done_rids = None
+                next_consensus_tree_match_rids = None
                 d2h_event = None
                 next_batch_result = None
 
@@ -477,8 +479,9 @@ class SchedulerPPMixin:
                 # ranks may observe different token counts under timeout
                 # policy and we MIN them to a single agreed length.
                 prefetch_done_rids: Dict[str, int] = {}
+                tree_match_rids: Dict[str, int] = {}
                 if l3_consensus_ring_enabled:
-                    bootstrapped_rids, prefetch_done_rids = (
+                    bootstrapped_rids, prefetch_done_rids, tree_match_rids = (
                         self._pp_pd_get_bootstrap_and_l3_done_ids()
                     )
                     pmbs[mb_id] = prefetch_done_rids
@@ -542,6 +545,7 @@ class SchedulerPPMixin:
                         send_consensus_bootstrapped_work,
                         consensus_bootstrapped_rids,
                         consensus_prefetch_done_rids,
+                        consensus_tree_match_rids,
                     ) = self._pp_pd_send_consensus_bootstrap_and_l3_done_ids(
                         bmbs,
                         next_first_rank_mb_id,
@@ -549,6 +553,8 @@ class SchedulerPPMixin:
                         bootstrapped_rids,
                         consensus_prefetch_done_rids,
                         prefetch_done_rids,
+                        consensus_tree_match_rids,
+                        tree_match_rids,
                     )
                 else:
                     send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
@@ -567,15 +573,24 @@ class SchedulerPPMixin:
 
                 if bmbs[next_mb_id] is not None:
                     # Combined recv when L3 ring is enabled: consensus
-                    # payload is a (bootstrapped, prefetch_done_dict) tuple
-                    # produced by _pp_pd_send_consensus_bootstrap_and_l3_done_ids.
-                    # prefetch_done_dict is rid -> agreed effective_hit_tokens
-                    # (PP-MIN). _pp_recv_pyobj_from_prev_stage() also
-                    # broadcasts to all attn_tp / attn_cp ranks so schedule
-                    # decisions stay TP-consistent.
+                    # payload is a (bootstrapped, prefetch_done_dict,
+                    # tree_match_dict) tuple produced by
+                    # _pp_pd_send_consensus_bootstrap_and_l3_done_ids.
+                    # tree_match_dict is rid -> agreed page-aligned
+                    # match_prefix length (PP-MIN). Backward-compat
+                    # accepts 2-tuple legacy payload during rolling
+                    # deploys; new field defaults to {}.
                     raw = self._pp_recv_pyobj_from_prev_stage()
                     if l3_consensus_ring_enabled:
-                        next_consensus_bootstrapped_rids, next_l3_payload = raw
+                        if len(raw) == 3:
+                            (
+                                next_consensus_bootstrapped_rids,
+                                next_l3_payload,
+                                next_tree_match_payload,
+                            ) = raw
+                        else:
+                            next_consensus_bootstrapped_rids, next_l3_payload = raw
+                            next_tree_match_payload = {}
                         # Apply L3 consensus immediately so the NEXT
                         # add_one_req sees admitted rids.
                         #
@@ -606,6 +621,21 @@ class SchedulerPPMixin:
                                 )
                         else:
                             next_consensus_prefetch_done_rids = {}
+                        # Apply tree-match consensus. Truncates per-rank
+                        # match_prefix divergence to PP-MIN so admit
+                        # uses the same prefix length on every rank.
+                        if next_tree_match_payload:
+                            tc = self.tree_cache
+                            try:
+                                tc.apply_tree_match_consensus(next_tree_match_payload)
+                            except AttributeError:
+                                # Older tree_cache without the API; the
+                                # ring still flows the field but admit
+                                # truncation is skipped.
+                                pass
+                            next_consensus_tree_match_rids = next_tree_match_payload
+                        else:
+                            next_consensus_tree_match_rids = {}
                     else:
                         next_consensus_bootstrapped_rids = raw
                     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
@@ -637,7 +667,11 @@ class SchedulerPPMixin:
                     # When disabled, send raw bootstrapped_rids exactly
                     # like the original code path.
                     if l3_consensus_ring_enabled:
-                        bootstrap_payload = (bootstrapped_rids, prefetch_done_rids)
+                        bootstrap_payload = (
+                            bootstrapped_rids,
+                            prefetch_done_rids,
+                            tree_match_rids,
+                        )
                     else:
                         bootstrap_payload = bootstrapped_rids
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
@@ -661,6 +695,7 @@ class SchedulerPPMixin:
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
                 if l3_consensus_ring_enabled:
                     consensus_prefetch_done_rids = next_consensus_prefetch_done_rids
+                    consensus_tree_match_rids = next_consensus_tree_match_rids
 
                 self.running_batch.batch_is_full = False
 
@@ -1253,23 +1288,26 @@ class SchedulerPPMixin:
         return send_consensus_prefetch_done_work, consensus_prefetch_done_rids
 
     def _pp_pd_get_bootstrap_and_l3_done_ids(self: Scheduler):
-        """Combined PHASE A intersect for bootstrap + L3 prefetch-done.
+        """Combined PHASE A intersect for bootstrap + L3 prefetch-done +
+        tree-match length.
 
-        Single P2P recv carries both payloads so we save one round-trip
-        per mb_id vs. the two separate helpers
-        (``_pp_pd_get_bootstrapped_ids`` + ``_pp_pd_get_prefetch_done_ids``).
+        Single P2P recv carries all three payloads so we save round-trips
+        per mb_id vs. separate helpers.
 
         Wire format on the ring (per non-first rank):
-            recv  ([prev_good, prev_bad], prev_prefetch_done_dict)
-            send  ([new_good,  new_bad],  new_prefetch_done_dict)
+            recv  ([prev_good, prev_bad], prev_prefetch_done_dict, prev_tree_match_dict)
+            send  ([new_good,  new_bad],  new_prefetch_done_dict,  new_tree_match_dict)
 
         prefetch_done is a ``dict[rid, effective_hit_tokens]`` (NOT a set).
-        Intersection takes MIN of effective_hit_tokens per rid -- this
-        makes the consensus carry the agreed-on length, so peek can
-        truncate to that length and every PP rank injects exactly the
-        same #tokens. Without the length, ranks would inject different
-        amounts (mooncake completion timing varies per rank under
-        timeout policy) -> IPC shape mismatch crash.
+        tree_match is a ``dict[rid, page_aligned_match_len]`` for each rid
+        in the local waiting queue. Both are intersected by PP-MIN so the
+        consensus carries the agreed lengths; admit truncates
+        ``req.prefix_indices`` accordingly. Without the tree-match
+        consensus, per-rank tree state divergence (e.g. eviction
+        asymmetry from per-rank L3 prefetch slot pressure) leaves
+        different ranks computing different prefix lengths for the same
+        rid -> different ``extend_input_len`` -> IPC shape mismatch
+        crash (observed in dump 1782082*).
 
         Used only by the disagg-prefill loop; the standalone helpers are
         left intact for the decode loop and any non-L3-aware callers.
@@ -1281,12 +1319,20 @@ class SchedulerPPMixin:
             [KVPoll.Failed],
         )
         local_prefetch_done = self._tree_cache_local_prefetch_done_rids()
+        local_tree_match = self._compute_local_tree_match_lens()
 
         if self.pp_group.is_first_rank:
-            return [local_good, local_bad], local_prefetch_done
+            return [local_good, local_bad], local_prefetch_done, local_tree_match
 
         payload = self._pp_recv_pyobj_from_prev_stage()
-        prev_bootstrapped, prev_prefetch_done = payload
+        # Backward-compat: accept both 2-tuple (legacy) and 3-tuple wire
+        # formats so a mixed-version ring doesn't deadlock during a
+        # rolling deploy. New tree-match field defaults to {}.
+        if len(payload) == 3:
+            prev_bootstrapped, prev_prefetch_done, prev_tree_match = payload
+        else:
+            prev_bootstrapped, prev_prefetch_done = payload
+            prev_tree_match = {}
         prev_good, prev_bad = prev_bootstrapped
 
         good = list(set(prev_good) & set(local_good))
@@ -1299,7 +1345,14 @@ class SchedulerPPMixin:
             rid: min(prev_prefetch_done[rid], local_prefetch_done[rid])
             for rid in (set(prev_prefetch_done) & set(local_prefetch_done))
         }
-        return [good, bad], prefetch_done
+        # Same MIN for tree-match length: only keep rids that EVERY
+        # upstream rank reported (intersection), and take the smallest
+        # match length so the agreed prefix is in every rank's tree.
+        tree_match = {
+            rid: min(prev_tree_match[rid], local_tree_match[rid])
+            for rid in (set(prev_tree_match) & set(local_tree_match))
+        }
+        return [good, bad], prefetch_done, tree_match
 
     def _pp_pd_send_consensus_bootstrap_and_l3_done_ids(
         self: Scheduler,
@@ -1309,10 +1362,13 @@ class SchedulerPPMixin:
         bootstrapped_rids: List[List[str]],
         consensus_prefetch_done_rids: Optional[Dict[str, int]],
         prefetch_done_rids: Dict[str, int],
+        consensus_tree_match_rids: Optional[Dict[str, int]] = None,
+        tree_match_rids: Optional[Dict[str, int]] = None,
     ):
-        """Combined PHASE B forward for bootstrap + L3 prefetch-done.
+        """Combined PHASE B forward for bootstrap + L3 prefetch-done +
+        tree-match length.
 
-        Single P2P send carries both consensus payloads. Mirrors
+        Single P2P send carries all three consensus payloads. Mirrors
         ``_pp_pd_send_consensus_bootstrapped_ids`` exactly for the gate
         (last_rank uses ``bmbs[next_first_rank_mb_id]``; others gate on
         whether they received a consensus tuple last iter).
@@ -1321,15 +1377,19 @@ class SchedulerPPMixin:
         loop (both populated in PHASE A every iter when L3 ring is
         enabled), so a single bmbs-keyed gate is sufficient for both.
         """
+        if tree_match_rids is None:
+            tree_match_rids = {}
         work: List[P2PWork] = []
         if self.pp_group.is_last_rank:
             if bmbs[next_first_rank_mb_id] is not None:
                 # last_rank: my PHASE-A intersect is the global consensus
                 consensus_bootstrapped_rids = bootstrapped_rids
                 consensus_prefetch_done_rids = prefetch_done_rids
+                consensus_tree_match_rids = tree_match_rids
                 payload = (
                     consensus_bootstrapped_rids,
                     consensus_prefetch_done_rids,
+                    consensus_tree_match_rids,
                 )
                 work = self._pp_send_pyobj_to_next_stage(payload, async_send=True)
         else:
@@ -1345,15 +1405,109 @@ class SchedulerPPMixin:
                         if consensus_prefetch_done_rids is not None
                         else {}
                     ),
+                    (
+                        consensus_tree_match_rids
+                        if consensus_tree_match_rids is not None
+                        else {}
+                    ),
                 )
                 work = self._pp_send_pyobj_to_next_stage(payload, async_send=True)
-        return work, consensus_bootstrapped_rids, consensus_prefetch_done_rids
+        return (
+            work,
+            consensus_bootstrapped_rids,
+            consensus_prefetch_done_rids,
+            consensus_tree_match_rids,
+        )
 
     def _tree_cache_local_prefetch_done_rids(self: Scheduler) -> Dict[str, int]:
         """Adapter so the ring helper does not assume a specific tree cache.
 
         Returns a snapshot dict of ``rid -> local effective_hit_tokens``.
         """
+        tc = getattr(self, "tree_cache", None)
+        if tc is None:
+            return {}
+        local = getattr(tc, "_local_prefetch_done_rids", None)
+        if local is None:
+            return {}
+        # Return a shallow copy snapshot so the caller can mutate freely.
+        return dict(local)
+
+    def _compute_local_tree_match_lens(self: Scheduler) -> Dict[str, int]:
+        """Compute per-rid local ``match_prefix`` length for every rid in
+        the waiting queue.
+
+        Used for the PP-MIN tree-match consensus contribution. Each rank
+        builds the same RadixKey for each rid (token-content keyed) but
+        their local trees may differ in eviction state -- the resulting
+        match length is what diverges across PP. Taking MIN at PHASE A
+        intersect and applying at admit gives every rank the same
+        ``extend_input_len`` for the same rid.
+
+        Skips reqs whose ``prefix_indices`` is already non-empty (chunked
+        mid-stream -- their prefix was set by an earlier admit and is
+        carried across chunks via cache_unfinished_req's
+        kv_indices_orig branch; we don't re-consensus those).
+
+        Returns ``dict[rid, page_aligned_match_len]``. Empty when the
+        tree cache has no ``match_prefix`` API (decode-only, etc.) or
+        the waiting queue is empty.
+        """
+        tc = getattr(self, "tree_cache", None)
+        if tc is None or not hasattr(tc, "match_prefix"):
+            return {}
+        wq = getattr(self, "waiting_queue", None)
+        if not wq:
+            return {}
+        try:
+            from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+            from sglang.srt.mem_cache.radix_cache import RadixKey
+        except Exception:  # noqa: BLE001
+            return {}
+        result: Dict[str, int] = {}
+        for req in wq:
+            try:
+                # Skip reqs already mid-stream (prefix_indices set by a
+                # prior admit). Their prefix is preserved across chunk
+                # boundaries by cache_unfinished_req and is already
+                # PP-consistent from the prior consensus.
+                pi = getattr(req, "prefix_indices", None)
+                if pi is not None and len(pi) > 0:
+                    continue
+                fill_ids = list(req.origin_input_ids) + list(req.output_ids)
+                if not fill_ids:
+                    result[req.rid] = 0
+                    continue
+                # Cap at input length minus 1 so we don't claim the
+                # final token as a cache hit (mirrors
+                # _compute_max_prefix_len behavior in schedule_batch.py).
+                token_ids_to_match = fill_ids[: max(0, len(fill_ids) - 1)]
+                if not token_ids_to_match:
+                    result[req.rid] = 0
+                    continue
+                match_result = tc.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(
+                            token_ids=token_ids_to_match,
+                            extra_key=getattr(req, "extra_key", None),
+                        ),
+                        req=req,
+                    )
+                )
+                # device_indices is a torch.Tensor or list-like; .numel()
+                # for tensor, len() for list. Try both defensively.
+                dev = match_result.device_indices
+                try:
+                    n = dev.numel()
+                except AttributeError:
+                    n = len(dev) if dev is not None else 0
+                result[req.rid] = int(n)
+            except Exception:  # noqa: BLE001 — never break the ring
+                # On any error, omit the rid from contribution so PHASE A
+                # intersect treats it as "not present" (rid won't be in
+                # consensus this round; admit on this rank would defer).
+                continue
+        return result
         tc = getattr(self, "tree_cache", None)
         if tc is None:
             return {}

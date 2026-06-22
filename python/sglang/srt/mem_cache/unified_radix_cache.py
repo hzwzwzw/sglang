@@ -494,6 +494,16 @@ class UnifiedRadixCache(BasePrefixCache):
         # ``release_aborted_request`` to know not to double-free slots that
         # are now owned by an in-flight req.
         self._consumed_l3_handoff_rids: set[str] = set()
+        # PP-MIN consensus on tree-match length per rid (Plan A admit-time
+        # prefix consensus). Each rank computes its local match_prefix
+        # length for every rid in waiting_queue and contributes via the
+        # bootstrap+L3 ring; PHASE A intersect takes MIN; PHASE B writes
+        # the agreed length here. At admit time, scheduler truncates
+        # ``req.prefix_indices`` to ``agreed_tree_match + agreed_l3_inject``
+        # so every PP rank uses the same ``extend_input_len``, eliminating
+        # IPC shape mismatch from per-rank tree state divergence (e.g.
+        # eviction asymmetry from per-rank L3 prefetch slot pressure).
+        self._agreed_tree_match_lens: dict[str, int] = {}
         self.ongoing_prefetch: dict[
             str,
             tuple[
@@ -2430,6 +2440,46 @@ class UnifiedRadixCache(BasePrefixCache):
             n_applied += 1
         return n_applied
 
+    def apply_tree_match_consensus(self, payload: dict) -> int:
+        """Apply a PHASE-B tree-match-length consensus payload.
+
+        ``payload`` is rid -> agreed_tree_match_len (PP-MIN of each
+        rank's local ``match_prefix`` page-aligned length). Stored
+        for the scheduler to consult at admit time, where it truncates
+        ``req.prefix_indices`` to the agreed length so every PP rank
+        runs forward with the same ``extend_input_len``.
+
+        Returns the number of rids stored.
+        """
+        if not payload:
+            return 0
+        # Replace, not update -- the agreed length for a rid only stays
+        # relevant for the next admit; if the rid drops out of the ring
+        # consensus (e.g. admitted on all ranks last round), let it
+        # disappear instead of lingering.
+        self._agreed_tree_match_lens.update(payload)
+        return len(payload)
+
+    def pop_agreed_tree_match_len(self, rid: str) -> Optional[int]:
+        """Drain the consensus entry for ``rid`` after admission.
+
+        Called from the scheduler once add_one_req returns CONTINUE so
+        the dict stays bounded. Returns the agreed length (for diag /
+        logging) or ``None`` if no consensus was registered.
+        """
+        return self._agreed_tree_match_lens.pop(rid, None)
+
+    def peek_agreed_tree_match_len(self, rid: str) -> Optional[int]:
+        """Non-destructive read of the consensus length for ``rid``.
+
+        Used by the scheduler at admit time to compute the truncated
+        prefix length BEFORE calling ``add_one_req``. The actual pop
+        only happens after admission succeeds (mirrors the L3 handoff
+        peek/pop pattern -- a NO_TOKEN rejection leaves the entry so
+        the next iteration can re-apply).
+        """
+        return self._agreed_tree_match_lens.get(rid)
+
     def drain_pending_pop_indices(self) -> int:
         """Tick the deferred-pop drain.
 
@@ -2465,6 +2515,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        # Drop any tree-match consensus entry; if the req aborted before
+        # admission, the agreed length is stale.
+        self._agreed_tree_match_lens.pop(rid, None)
         # Free any device-indices that were handed off but never consumed
         # (e.g., prefetch finished, scheduler hadn't picked the req up
         # yet, then req aborted). Without this, the device slots leak.
