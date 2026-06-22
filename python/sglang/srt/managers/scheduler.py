@@ -469,8 +469,10 @@ class Scheduler(
         # Cache hasattr lookup for the L3 handoff API (used per-req in the
         # prefill schedule loop). tree_cache is set once and never
         # replaced, so this stays valid for the scheduler's lifetime.
+        # The Plan A tree-match consensus API is what gates the truncation
+        # at admit time; per-req L3 inject was removed (Y plan).
         self._tree_cache_supports_l3_handoff = hasattr(
-            self.tree_cache, "peek_prefetch_device_indices"
+            self.tree_cache, "peek_agreed_tree_match_len"
         )
         # Wire the crash_diag ring as a tree-write event recorder so
         # cache_unfinished_req / cache_finished_req calls land in the
@@ -2638,57 +2640,12 @@ class Scheduler(
                         action="admit",
                     )
 
-            l3_dev = None
-            if self.enable_hicache_storage and self._tree_cache_supports_l3_handoff:
-                # Per-req L3 handoff: the prefetched prefix lives in
-                # device slots that were allocated by check_prefetch_progress
-                # but NOT inserted into the radix tree (the async insert was
-                # the PP-rank desync source). Concatenate those device
-                # indices onto req.prefix_indices so the model forward sees
-                # the L3 prefix as already-cached. Subsequent reqs only see
-                # this prefix in the tree AFTER this req completes (via the
-                # synchronous cache_finished_req write-through).
-                #
-                # IMPORTANT: do NOT bump cache_protected_len. cache_unfinished_req
-                # at line 786 asserts cache_protected_len <= len(new_indices)+
-                # page_size-1, where new_indices comes from a fresh
-                # match_prefix that won't see L3 (not in tree). The L3
-                # portion is preserved across chunk boundaries via the
-                # kv_indices_orig branch at unified_radix_cache.py:803-805.
-                #
-                # PEEK only — committed via pop only after add_one_req
-                # returns CONTINUE. If add_one_req returns NO_TOKEN, the
-                # entry stays in tree_cache so the next scheduling attempt
-                # can re-inject without leaking the device slots.
-                #
-                # PP>1 SAFETY GATE (Plan A residual fix): under PP>1,
-                # peek_prefetch_device_indices is asymmetric across ranks
-                # because the apply_l3_consensus live filter silently
-                # skips a rid on ranks whose local indices is missing.
-                # That makes some ranks inject N tokens while others
-                # inject 0 -> different extend_input_len -> IPC shape
-                # mismatch crash (logs/sglang_crash_pp6_*1782127292*.json
-                # is the latest example: pp6 injected 1024 for
-                # 5f83577b85b6 while pp0-5 injected 0; admit log on every
-                # rank showed identical tree-match consensus, but L3
-                # inject diverged between admit log and forward).
-                #
-                # Disable inject under PP>1: subsequent reqs sharing the
-                # prefix still benefit via cache_finished_req's
-                # synchronous tree write-through (which Plan A tree-match
-                # consensus now keeps PP-consistent at admit time). We
-                # just lose the first-touch L3 benefit on the rid that
-                # triggered the prefetch. Slots get reclaimed via the
-                # existing pop_prefetch_device_indices(consumed=False)
-                # path below (caller frees leftover_l3 since
-                # inject_happened is False).
-                if getattr(self.ps, "pp_size", 1) <= 1:
-                    l3_dev = self.tree_cache.peek_prefetch_device_indices(req.rid)
-                    if l3_dev is not None and l3_dev.numel() > 0:
-                        req.prefix_indices = torch.cat([req.prefix_indices, l3_dev])
-                        req.set_extend_input_len(
-                            len(req.fill_ids) - len(req.prefix_indices)
-                        )
+            # NOTE: per-req L3 inject (peek_prefetch_device_indices + cat)
+            # was removed in favor of synchronous tree-insert at
+            # check_prefetch_progress time (Y plan). The L3 prefix is now
+            # in the radix tree; init_next_round_input above already saw
+            # it via match_prefix. Plan A tree-match PP-MIN truncation
+            # handles cross-rank state divergence.
 
             res = adder.add_one_req(
                 req,
@@ -2713,51 +2670,19 @@ class Scheduler(
                 bool(adder.can_run_list) and adder.can_run_list[-1] is req
             )
 
-            # Always finalize the L3 handoff once the req is admitted. Two
-            # cases:
-            #   (a) inject happened (l3_dev is not None): the device slots
-            #       are now referenced by req.prefix_indices and will be
-            #       freed by cache_finished_req via tree write-through. We
-            #       only need to remove the bookkeeping entry.
-            #   (b) inject did NOT happen (l3_dev is None — usually means
-            #       the PP consensus hadn't arrived yet when this req was
-            #       picked): the device slots in _prefetch_device_indices_by_reqid
-            #       are now orphaned (req is running without them). They
-            #       must be freed explicitly or the pool leaks. SWA paired
-            #       slots are freed via the full->swa mapping the load op
-            #       already wired up.
-            # On NO_TOKEN (req NOT in can_run_list), leave the entry so
-            # the next scheduling iteration can re-inject from the same
-            # device slots.
+            # Drain the Plan A tree-match consensus entry on successful
+            # admit so the dict stays bounded. Per-req L3 inject was
+            # removed (Y plan -- prefetch now inserts directly into the
+            # radix tree via check_prefetch_progress, no side channel).
             if (
                 req_was_admitted
                 and self.enable_hicache_storage
                 and self._tree_cache_supports_l3_handoff
             ):
-                # Drain the tree-match consensus entry so the dict stays
-                # bounded. Done here on every admit (not just inject) so
-                # rids with no L3 hit but truncated prefix also get
-                # cleaned up.
                 try:
                     self.tree_cache.pop_agreed_tree_match_len(req.rid)
                 except AttributeError:
                     pass
-                # consumed=True when inject happened (slots owned by req);
-                # consumed=False when inject didn't happen (peek/pop race
-                # — pop sees indices that consensus arrived for between
-                # peek and pop, but they were never injected, so the
-                # caller frees them and we must NOT defer the dict
-                # removal (otherwise apply_l3_consensus could double-free).
-                inject_happened = l3_dev is not None and l3_dev.numel() > 0
-                leftover_l3 = self.tree_cache.pop_prefetch_device_indices(
-                    req.rid, consumed=inject_happened
-                )
-                if (
-                    leftover_l3 is not None
-                    and leftover_l3.numel() > 0
-                    and not inject_happened
-                ):
-                    self.token_to_kv_pool_allocator.free(leftover_l3)
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -3291,37 +3216,6 @@ class Scheduler(
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
             return
-
-        # Diagnostic for L3 handoff leak: at idle there should be zero
-        # entries in _prefetch_device_indices_by_reqid. If we see any,
-        # log the rids + slot count + handoff-in-flight count so we
-        # can identify the control-flow path that bypassed cleanup.
-        # Do NOT modify state here -- both the indices and consensus
-        # dicts are PP-shared via the ring; an asymmetric clear (one
-        # rank scrubs while another doesn't) creates schedule
-        # divergence and the 11-vs-8192 IPC mismatch we saw before.
-        if self.enable_hicache_storage and hasattr(
-            self.tree_cache, "_prefetch_device_indices_by_reqid"
-        ):
-            tc = self.tree_cache
-            n_handoffs = len(tc._prefetch_device_indices_by_reqid)
-            if n_handoffs > 0:
-                total_slots = sum(
-                    int(t.numel())
-                    for t in tc._prefetch_device_indices_by_reqid.values()
-                    if t is not None
-                )
-                rids_sample = list(tc._prefetch_device_indices_by_reqid.keys())[:20]
-                logger.warning(
-                    "[hicache] L3 handoff orphans at idle: %d rid(s) holding %d slots, "
-                    "in_flight=%d, local=%d, global=%d. Sample rids: %s. (diagnostic; state not modified)",
-                    n_handoffs,
-                    total_slots,
-                    len(getattr(tc, "_handoff_in_flight", {})),
-                    len(getattr(tc, "_local_prefetch_done_rids", {})),
-                    len(getattr(tc, "_global_consensus_prefetch_done", {})),
-                    rids_sample,
-                )
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).

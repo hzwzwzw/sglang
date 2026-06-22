@@ -124,12 +124,7 @@ class SchedulerCrashDiag:
                     "ongoing_write_through",
                     "ongoing_backup",
                     "_handoff_in_flight",
-                    "_local_prefetch_done_rids",
-                    "_global_consensus_prefetch_done",
-                    "_prefetch_device_indices_by_reqid",
                     "prefetch_loaded_tokens_by_reqid",
-                    "_pending_pop_indices",
-                    "_consumed_l3_handoff_rids",
                     "_agreed_tree_match_lens",
                     "evictable_device_leaves",
                     "evictable_host_leaves",
@@ -178,11 +173,7 @@ class SchedulerCrashDiag:
                             except Exception:
                                 pass
                 # Sample rids for the cross-rank diffable dicts.
-                for attr in (
-                    "_local_prefetch_done_rids",
-                    "_global_consensus_prefetch_done",
-                    "_agreed_tree_match_lens",
-                ):
+                for attr in ("_agreed_tree_match_lens",):
                     val = getattr(tc, attr, None)
                     if val:
                         try:
