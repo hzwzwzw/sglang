@@ -2660,12 +2660,35 @@ class Scheduler(
                 # returns CONTINUE. If add_one_req returns NO_TOKEN, the
                 # entry stays in tree_cache so the next scheduling attempt
                 # can re-inject without leaking the device slots.
-                l3_dev = self.tree_cache.peek_prefetch_device_indices(req.rid)
-                if l3_dev is not None and l3_dev.numel() > 0:
-                    req.prefix_indices = torch.cat([req.prefix_indices, l3_dev])
-                    req.set_extend_input_len(
-                        len(req.fill_ids) - len(req.prefix_indices)
-                    )
+                #
+                # PP>1 SAFETY GATE (Plan A residual fix): under PP>1,
+                # peek_prefetch_device_indices is asymmetric across ranks
+                # because the apply_l3_consensus live filter silently
+                # skips a rid on ranks whose local indices is missing.
+                # That makes some ranks inject N tokens while others
+                # inject 0 -> different extend_input_len -> IPC shape
+                # mismatch crash (logs/sglang_crash_pp6_*1782127292*.json
+                # is the latest example: pp6 injected 1024 for
+                # 5f83577b85b6 while pp0-5 injected 0; admit log on every
+                # rank showed identical tree-match consensus, but L3
+                # inject diverged between admit log and forward).
+                #
+                # Disable inject under PP>1: subsequent reqs sharing the
+                # prefix still benefit via cache_finished_req's
+                # synchronous tree write-through (which Plan A tree-match
+                # consensus now keeps PP-consistent at admit time). We
+                # just lose the first-touch L3 benefit on the rid that
+                # triggered the prefetch. Slots get reclaimed via the
+                # existing pop_prefetch_device_indices(consumed=False)
+                # path below (caller frees leftover_l3 since
+                # inject_happened is False).
+                if getattr(self.ps, "pp_size", 1) <= 1:
+                    l3_dev = self.tree_cache.peek_prefetch_device_indices(req.rid)
+                    if l3_dev is not None and l3_dev.numel() > 0:
+                        req.prefix_indices = torch.cat([req.prefix_indices, l3_dev])
+                        req.set_extend_input_len(
+                            len(req.fill_ids) - len(req.prefix_indices)
+                        )
 
             res = adder.add_one_req(
                 req,
