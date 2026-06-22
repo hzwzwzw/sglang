@@ -1491,10 +1491,16 @@ class SchedulerPPMixin:
         intersect and applying at admit gives every rank the same
         ``extend_input_len`` for the same rid.
 
-        Skips reqs whose ``prefix_indices`` is already non-empty (chunked
-        mid-stream -- their prefix was set by an earlier admit and is
-        carried across chunks via cache_unfinished_req's
-        kv_indices_orig branch; we don't re-consensus those).
+        Contributes for EVERY rid in waiting_queue every mb_id, including
+        cache-hit reqs deferred awaiting consensus. A previous version
+        skipped reqs whose ``prefix_indices`` was already non-empty
+        (intended for chunked mid-stream reqs), but chunked reqs leave
+        waiting_queue for ``chunked_req`` after first admit so the skip
+        only ever filtered DEFERRED cache-hit reqs -- which is exactly
+        the wrong direction (those rids never reached the consensus
+        ring, never got an agreed_len, and admit deferred them
+        infinitely; observed in logs/sglang_pp_admit_pp*_tp0.log
+        showing rids deferred 7K+ times never making it to PHASE_A_OUT).
 
         Returns ``dict[rid, page_aligned_match_len]``. Empty when the
         tree cache has no ``match_prefix`` API (decode-only, etc.) or
@@ -1529,13 +1535,6 @@ class SchedulerPPMixin:
             _diag = None
         for req in wq:
             try:
-                # Skip reqs already mid-stream (prefix_indices set by a
-                # prior admit). Their prefix is preserved across chunk
-                # boundaries by cache_unfinished_req and is already
-                # PP-consistent from the prior consensus.
-                pi = getattr(req, "prefix_indices", None)
-                if pi is not None and len(pi) > 0:
-                    continue
                 fill_ids = list(req.origin_input_ids) + list(req.output_ids)
                 if not fill_ids:
                     result[req.rid] = 0
