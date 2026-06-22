@@ -2387,15 +2387,42 @@ class UnifiedRadixCache(BasePrefixCache):
         ``req.prefix_indices`` to the agreed length so every PP rank
         runs forward with the same ``extend_input_len``.
 
+        CLEAR-BEFORE-UPDATE: each round's payload is a complete snapshot
+        of consensus. We replace the dict (not just update) so stale
+        entries from earlier rounds don't survive when a rid's local
+        state changes after the original consensus was reached.
+
+        Without clear: rid had local=1024 on all ranks for many rounds,
+        agreed=1024 propagated. Suddenly rank R evicts the chain,
+        local_R drops to 0. Round T's PHASE A intersect contributes
+        local_R=0 -> agreed=0 (correct). But by the time round T's
+        PHASE B reaches each rank, those ranks may already have admitted
+        the rid using STALE agreed=1024 from earlier rounds (observed
+        in dump 1782150316125: pp1 admitted c248ab317ede with stale
+        agreed=1024 although its current local was 0; pp0 with local=1024
+        also admitted; both with agreed=1024 but final prefix diverged
+        because rank R's host_hit_length=0 vs rank A's host_hit_length=1024
+        -> IPC mismatch).
+
+        With clear: each round's apply re-establishes the consensus from
+        scratch. Rids absent from the latest round (because they aborted,
+        admitted on some rank, or some rank's contribution dropped them)
+        disappear from the dict; admit on those rids defers (peek
+        returns None) until consensus catches up.
+
         Returns the number of rids stored.
         """
         if not payload:
+            # Empty payload from this round means no rid survived
+            # intersect (e.g., a rank's waiting_queue is empty). Treat
+            # as "no fresh consensus" -- do NOT clear, leave existing
+            # entries so admit can still proceed if the rid was already
+            # in consensus from a recent round and is genuinely valid.
+            # Real rid drop-outs will be cleared by the next non-empty
+            # payload that doesn't include them.
             return 0
-        # Replace, not update -- the agreed length for a rid only stays
-        # relevant for the next admit; if the rid drops out of the ring
-        # consensus (e.g. admitted on all ranks last round), let it
-        # disappear instead of lingering.
-        self._agreed_tree_match_lens.update(payload)
+        # Replace -- only rids in the current round's payload remain.
+        self._agreed_tree_match_lens = dict(payload)
         return len(payload)
 
     def pop_agreed_tree_match_len(self, rid: str) -> Optional[int]:
