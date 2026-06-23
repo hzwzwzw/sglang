@@ -1400,26 +1400,22 @@ class SchedulerPPMixin:
                         req=req,
                     )
                 )
-                # device_indices is a torch.Tensor or list-like; .numel()
-                # for tensor, len() for list. Try both defensively.
+                # Contribute DEVICE-resident match length only. We
+                # explicitly do NOT include host_hit_length: per-rank
+                # host residency on the radix tree (set by
+                # cache_finished_req's mooncake write-back; consumed
+                # by PrefillAdder.add_one_req via init_load_back) has no
+                # consensus mechanism that can keep up with the ring's
+                # rotation lag (>=1 round). Forcing host_hit_length=0
+                # at admit (in scheduler.py admit path) is the safer
+                # path under PP>1; the host-cache-bypass cost is a
+                # constant lost-fetch, not a divergent crash.
                 dev = match_result.device_indices
                 try:
-                    n_device = dev.numel()
+                    n = dev.numel()
                 except AttributeError:
-                    n_device = len(dev) if dev is not None else 0
-                # CRITICAL: include host_hit_length. PrefillAdder.add_one_req
-                # calls init_load_back when host_hit_length > 0, which
-                # APPENDS host->device-loaded slots to req.prefix_indices.
-                # Without this, the consensus only constrains the device
-                # part; the host-loaded portion grows per-rank and causes
-                # IPC mismatch (observed in dump 1782138458*: pp1 admitted
-                # with prefix=1024 ext=2120 while pp0 had prefix=0
-                # ext=3144 for the SAME rid -- admit log on both showed
-                # local=0 agreed=0 final_prefix=0, then init_load_back
-                # grew pp1's prefix by 1024 host-loaded tokens).
-                n_host = int(getattr(match_result, "host_hit_length", 0) or 0)
-                n = int(n_device) + n_host
-                result[req.rid] = n
+                    n = len(dev) if dev is not None else 0
+                result[req.rid] = int(n)
                 # Per-rank log: rid + local_match + token-content hash
                 # so cross-rank diff can verify "same content -> same
                 # match length" or pinpoint the rank that diverges.

@@ -2588,6 +2588,25 @@ class Scheduler(
                 local_device_len = len(req.prefix_indices)
                 local_host_len = int(getattr(req, "host_hit_length", 0) or 0)
                 local_match_len = local_device_len + local_host_len
+                # CRITICAL under PP>1: force host_hit_length to 0 to
+                # disable PrefillAdder's init_load_back path. The host
+                # residency on each rank's tree is per-rank state with
+                # no consensus tracking; PrefillAdder appends host-loaded
+                # slots to req.prefix_indices AFTER admit log fires,
+                # which means per-rank prefix grows divergently by
+                # host_hit_length even when device-only consensus is
+                # consistent (observed in dump 1782154361357: pp5 had
+                # local_host=1024 while pp0-4 had 0; all ranks saw
+                # agreed=1024 (stale from earlier round when all had
+                # 1024); pp5 admitted with init_load_back -> prefix=1024,
+                # others without -> prefix=0; ring lag prevents the
+                # NEW round's agreed=0 from arriving in time).
+                # PP=1 unaffected (no ring, no cross-rank issue).
+                req.host_hit_length = 0
+                if hasattr(req, "swa_host_hit_length"):
+                    req.swa_host_hit_length = 0
+                if hasattr(req, "mamba_host_hit_length"):
+                    req.mamba_host_hit_length = 0
                 # Per-rank log: capture each admit decision so cross-rank
                 # diff pinpoints the rid where decisions diverge.
                 try:
@@ -2615,34 +2634,13 @@ class Scheduler(
                     # init_next_round_input was idempotent so re-running
                     # next mb_id is fine.
                     continue
-                if agreed_tree_len < local_match_len:
-                    # Truncate so total prefix (device + host-load-back)
-                    # equals agreed_tree_len. Two cases:
-                    #  (a) agreed <= device: truncate device, drop all host
-                    #  (b) agreed > device: keep device, cap host to (agreed - device)
-                    if agreed_tree_len <= local_device_len:
-                        req.prefix_indices = req.prefix_indices[:agreed_tree_len]
-                        req.host_hit_length = 0
-                        if req.cache_protected_len > agreed_tree_len:
-                            req.cache_protected_len = agreed_tree_len
-                    else:
-                        # device fully kept; cap host to fill remainder
-                        req.host_hit_length = agreed_tree_len - local_device_len
-                    # SWA / mamba host hits should never exceed the
-                    # truncated total either; cap defensively.
-                    if (
-                        getattr(req, "swa_host_hit_length", 0)
-                        and req.swa_host_hit_length > req.host_hit_length
-                    ):
-                        req.swa_host_hit_length = req.host_hit_length
-                    if (
-                        getattr(req, "mamba_host_hit_length", 0)
-                        and req.mamba_host_hit_length > req.host_hit_length
-                    ):
-                        req.mamba_host_hit_length = req.host_hit_length
-                    req.set_extend_input_len(
-                        len(req.fill_ids) - len(req.prefix_indices)
-                    )
+                # Truncate device-resident prefix to PP-MIN. Host part
+                # was already forced to 0 above; only device matters.
+                if agreed_tree_len < local_device_len:
+                    req.prefix_indices = req.prefix_indices[:agreed_tree_len]
+                    if req.cache_protected_len > agreed_tree_len:
+                        req.cache_protected_len = agreed_tree_len
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 if _diag is not None and _diag.enabled:
                     _diag.log(
                         "ADMIT_DECISION",
@@ -2653,7 +2651,7 @@ class Scheduler(
                         local_host=local_host_len,
                         agreed_len=agreed_tree_len,
                         final_prefix=len(req.prefix_indices),
-                        final_host=int(getattr(req, "host_hit_length", 0) or 0),
+                        final_host=0,
                         final_ext=req.extend_input_len,
                         action="admit",
                     )
