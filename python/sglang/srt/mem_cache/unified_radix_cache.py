@@ -426,15 +426,12 @@ class UnifiedRadixCache(BasePrefixCache):
             int, tuple[Optional[torch.Tensor], list[PoolTransfer]]
         ] = {}
         self._handoff_id_counter: int = -1
-        # PP-MIN consensus on tree-match length per rid (Plan A admit-time
-        # prefix consensus). Each rank computes its local match_prefix
-        # length for every rid in waiting_queue and contributes via the
-        # bootstrap ring; PHASE A intersect takes MIN; PHASE B writes the
-        # agreed length here. At admit time, scheduler truncates
-        # ``req.prefix_indices`` to ``agreed_tree_match`` so every PP rank
-        # uses the same ``extend_input_len``, eliminating IPC shape
-        # mismatch from per-rank tree state divergence (e.g. L3 prefetch
-        # inserts arriving asynchronously across ranks).
+        # PP-MIN consensus on radix tree match length per rid in the
+        # waiting queue. Each rank contributes its local match_prefix
+        # length via the bootstrap ring; the agreed (PP-MIN) length is
+        # used at admit to truncate ``req.prefix_indices`` so every
+        # PP rank uses the same ``extend_input_len``. Only used when
+        # pp_size > 1 with hicache_storage enabled.
         self._agreed_tree_match_lens: dict[str, int] = {}
         self.ongoing_prefetch: dict[
             str,
@@ -2266,22 +2263,12 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
             if extra_tail:
                 self.cache_controller.append_host_mem_release(extra_pools=extra_tail)
-            # SYNCHRONOUS TREE INSERT (Y plan, replaces per-req inject):
-            # The H->D'd device_indices represent ``effective_hit_tokens``
-            # tokens of cached KV. Insert directly into the radix tree at
-            # ``last_host_node`` so future ``match_prefix`` (including
-            # init_next_round_input on the triggering req) finds it.
-            #
-            # PP-rank async insert is the historical desync source -- but
-            # Plan A's tree-match consensus (PP-MIN truncation at admit)
-            # tolerates per-rank tree state divergence. With Plan A
-            # active, ranks that inserted different lengths are reconciled
+            # Insert the H->D'd L3 prefix directly into the radix tree at
+            # ``last_host_node``. Future ``match_prefix`` (including the
+            # triggering req's ``init_next_round_input``) finds it.
+            # Per-rank async insert is tolerated by Plan A's tree-match
+            # PP-MIN consensus, which truncates divergent prefix lengths
             # at admit time.
-            #
-            # _insert_helper takes ownership of the device_indices via
-            # value.clone() inside _add_new_node; the original tensor's
-            # slot indices remain referenced (no double-free as long as
-            # we don't call allocator.free on device_indices afterwards).
             page_aligned_key = prefetch_key[:effective_hit_tokens].page_aligned(
                 self.page_size
             )
@@ -2305,17 +2292,12 @@ class UnifiedRadixCache(BasePrefixCache):
                         insert_params,
                     )
                     loaded_from_storage = effective_hit_tokens
-                    # Free unaligned tail (slots beyond page-alignment).
-                    # The aligned head is now owned by the tree; the tail
-                    # was allocated but never inserted, so free it.
+                    # Free unaligned tail; the aligned head is owned by
+                    # the tree (cloned via _add_new_node).
                     if effective_hit_tokens > page_aligned_len:
                         unaligned_tail = device_indices[page_aligned_len:]
                         if unaligned_tail.numel() > 0:
                             self.token_to_kv_pool_allocator.free(unaligned_tail)
-                    # Per-rank diag log: this insert is the analogue of
-                    # tree_finished_insert / tree_unfinished_insert; cross-rank
-                    # diff of these events shows the actually-inserted L3
-                    # depth per rid.
                     rec = getattr(self, "_tree_event_recorder", None)
                     if rec is not None:
                         try:
@@ -2331,9 +2313,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         except Exception:  # noqa: BLE001
                             pass
                 except Exception as e:  # noqa: BLE001
-                    # Best-effort: if insert fails, free the slots and
-                    # treat as no-L3-hit. Don't propagate -- prefetch
-                    # bookkeeping below still has to run.
+                    # Best-effort: free slots, treat as no-L3-hit.
                     logger.warning(
                         "[hicache] L3 tree insert failed for req=%s: %r", req_id, e
                     )
@@ -2382,66 +2362,27 @@ class UnifiedRadixCache(BasePrefixCache):
         """Apply a PHASE-B tree-match-length consensus payload.
 
         ``payload`` is rid -> agreed_tree_match_len (PP-MIN of each
-        rank's local ``match_prefix`` page-aligned length). Stored
-        for the scheduler to consult at admit time, where it truncates
-        ``req.prefix_indices`` to the agreed length so every PP rank
-        runs forward with the same ``extend_input_len``.
+        rank's local ``match_prefix`` page-aligned length). Each round's
+        payload is a complete snapshot, so we replace the dict instead
+        of merging -- otherwise stale entries from earlier rounds
+        survive when a rid's local state drops on some rank (eviction).
 
-        CLEAR-BEFORE-UPDATE: each round's payload is a complete snapshot
-        of consensus. We replace the dict (not just update) so stale
-        entries from earlier rounds don't survive when a rid's local
-        state changes after the original consensus was reached.
-
-        Without clear: rid had local=1024 on all ranks for many rounds,
-        agreed=1024 propagated. Suddenly rank R evicts the chain,
-        local_R drops to 0. Round T's PHASE A intersect contributes
-        local_R=0 -> agreed=0 (correct). But by the time round T's
-        PHASE B reaches each rank, those ranks may already have admitted
-        the rid using STALE agreed=1024 from earlier rounds (observed
-        in dump 1782150316125: pp1 admitted c248ab317ede with stale
-        agreed=1024 although its current local was 0; pp0 with local=1024
-        also admitted; both with agreed=1024 but final prefix diverged
-        because rank R's host_hit_length=0 vs rank A's host_hit_length=1024
-        -> IPC mismatch).
-
-        With clear: each round's apply re-establishes the consensus from
-        scratch. Rids absent from the latest round (because they aborted,
-        admitted on some rank, or some rank's contribution dropped them)
-        disappear from the dict; admit on those rids defers (peek
-        returns None) until consensus catches up.
-
-        Returns the number of rids stored.
+        Empty payload is a no-op so a single empty round (e.g. a rank's
+        waiting_queue briefly empty) doesn't starve in-flight rids.
         """
         if not payload:
-            # Empty payload from this round means no rid survived
-            # intersect (e.g., a rank's waiting_queue is empty). Treat
-            # as "no fresh consensus" -- do NOT clear, leave existing
-            # entries so admit can still proceed if the rid was already
-            # in consensus from a recent round and is genuinely valid.
-            # Real rid drop-outs will be cleared by the next non-empty
-            # payload that doesn't include them.
             return 0
-        # Replace -- only rids in the current round's payload remain.
         self._agreed_tree_match_lens = dict(payload)
         return len(payload)
 
     def pop_agreed_tree_match_len(self, rid: str) -> Optional[int]:
-        """Drain the consensus entry for ``rid`` after admission.
-
-        Called from the scheduler once add_one_req returns CONTINUE so
-        the dict stays bounded. Returns the agreed length (for diag /
-        logging) or ``None`` if no consensus was registered.
-        """
+        """Drain the consensus entry for ``rid`` after admission."""
         return self._agreed_tree_match_lens.pop(rid, None)
 
     def peek_agreed_tree_match_len(self, rid: str) -> Optional[int]:
-        """Non-destructive read of the consensus length for ``rid``.
-
-        Used by the scheduler at admit time to compute the truncated
-        prefix length BEFORE calling ``add_one_req``. The actual pop
-        only happens after admission succeeds (mirrors the L3 handoff
-        peek/pop pattern -- a NO_TOKEN rejection leaves the entry so
-        the next iteration can re-apply).
+        """Non-destructive read of the consensus length. Pop happens
+        after add_one_req succeeds so a NO_TOKEN rejection can re-try
+        on the next iteration.
         """
         return self._agreed_tree_match_lens.get(rid)
 

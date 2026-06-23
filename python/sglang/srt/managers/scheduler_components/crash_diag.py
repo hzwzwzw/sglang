@@ -7,9 +7,8 @@ steady-state cost; useful data only materializes on crash.
 Part A — rolling event ring (``record``):
     A bounded ``collections.deque`` of (timestamp, kind, fields)
     tuples. Each ``record(kind, **fields)`` call is a Python-level dict
-    construction + append, ~100us. Default capacity is 1000 entries
-    (a few seconds of mb_id-level activity at typical PP loop rates).
-    Fields must be JSON-serializable primitives.
+    construction + append, ~100us. Fields must be JSON-serializable
+    primitives.
 
 Part B — on-crash snapshot + dump (``dump_on_crash``):
     Wrap the scheduler's run_event_loop in try/except. On exception,
@@ -17,14 +16,10 @@ Part B — on-crash snapshot + dump (``dump_on_crash``):
     (queue lengths, dict sizes, ongoing trackers) to a JSON file.
     Best-effort: never raises, so it cannot mask the real crash.
 
-The scheduler crash handler at ``run_scheduler_process`` already
-catches and logs exceptions; we hook in front of that to capture state
-before the process exits.
-
 Disable / configure via env:
     SGLANG_CRASH_DIAG=0          disable entirely (zero overhead)
     SGLANG_CRASH_DUMP_DIR=/path  override default /tmp dump location
-    SGLANG_CRASH_DIAG_RING=1000  ring buffer capacity
+    SGLANG_CRASH_DIAG_RING=5000  ring buffer capacity
 """
 
 from __future__ import annotations

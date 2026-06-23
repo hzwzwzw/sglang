@@ -5,52 +5,19 @@ structured event log to ``/tmp/sglang_pp_admit_pp{N}_tp{M}.log`` (path
 overridable via ``SGLANG_PP_ADMIT_DIAG_DIR``). Events are flushed
 line-by-line so a crash leaves the most recent activity on disk.
 
-Why disk logs (vs. crash_diag's in-memory ring): the ring fills with
-idle ``schedule`` events at low QPS, so by the time a crash hits, the
-actually-divergent admission events are already evicted. Disk logs
-keep full history, and ``diff`` across rank files is much faster
-than mining ring buffers from JSON dumps.
+Disk logs (vs. crash_diag's in-memory ring) keep full history; the
+ring evicts older events at low QPS. ``diff`` across rank files is the
+fastest way to find where consensus or admit decisions started to
+diverge across ranks. See ``scripts/diff_admit_diag.sh`` for the
+analysis workflow.
 
-Event schema (one event per line, key=value fields):
+Event kinds emitted (one event per line, ``KIND key=value ...``):
 
-    LOCAL_TREE_MATCH pp=1 step=8790 mb=0 rid=98e04b91a88f local_len=1024 \
-        token_hash=ab12cd34 input_len=3144
-
-    PHASE_A_OUT pp=1 step=8790 mb=0 n_tree_match=997 sample_rids=07e1b...,98e04...
-
-    PHASE_B_IN pp=1 step=8791 mb=1 n_tree_match=995 sample_rids=07e1b...,98e04...
-
-    CONSENSUS_APPLY pp=1 step=8791 mb=1 n_payload=995 n_added=12 n_overwritten=3 \
-        sample_changed=98e04b91a88f:1024->768
-
-    ADMIT_DECISION pp=1 step=8790 mb=0 rid=98e04b91a88f \
-        local_len=1024 agreed_len=1024 action=admit final_ext=2120
-
-    ADMIT_DECISION pp=1 step=8790 mb=0 rid=98e04b91a88f \
-        local_len=1024 agreed_len=None action=defer
-
-    TREE_INSERT pp=1 step=8790 kind=finished rid=5bcac76c8278 \
-        palen=3072 prev_prefix_len=3072 result_prefix_len=3072 token_hash=ab12cd34
-
-    TREE_EVICT pp=1 depth=12 slots_freed=3072 alloc_avail_before=4352 \
-        alloc_avail_after=7424 trigger=alloc_pressure
-
-Cross-rank analysis workflow:
-
-    # Find the first rid where two ranks diverged on agreed_len.
-    grep ADMIT_DECISION /tmp/sglang_pp_admit_pp0_tp0.log > /tmp/d_pp0.txt
-    grep ADMIT_DECISION /tmp/sglang_pp_admit_pp1_tp0.log > /tmp/d_pp1.txt
-    diff /tmp/d_pp0.txt /tmp/d_pp1.txt | head -20
-
-    # Trace a specific divergent rid back to its origin.
-    for f in /tmp/sglang_pp_admit_pp*.log; do
-      echo "=== $f ==="
-      grep "rid=98e04b91a88f" "$f" | tail -20
-    done
-
-    # Compare insert events for a token sequence (token_hash matches if
-    # input content is the same -> tree depth should match).
-    grep "token_hash=ab12cd34" /tmp/sglang_pp_admit_pp*.log
+    LOCAL_TREE_MATCH      per-rid match_prefix length contribution
+    PHASE_A_OUT           tree-match dict this rank is forwarding
+    PHASE_B_IN            tree-match dict this rank received
+    ADMIT_DECISION        per-rid admit / defer decision
+    TREE_INSERT           cache_(un)finished_req insert event
 """
 
 from __future__ import annotations

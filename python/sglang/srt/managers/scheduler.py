@@ -466,11 +466,9 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
-        # Cache hasattr lookup for the L3 handoff API (used per-req in the
-        # prefill schedule loop). tree_cache is set once and never
-        # replaced, so this stays valid for the scheduler's lifetime.
-        # The Plan A tree-match consensus API is what gates the truncation
-        # at admit time; per-req L3 inject was removed (Y plan).
+        # Cache the hasattr lookup for the tree-match consensus API
+        # (used per-req in the prefill schedule loop). tree_cache is
+        # set once and never replaced.
         self._tree_cache_supports_l3_handoff = hasattr(
             self.tree_cache, "peek_agreed_tree_match_len"
         )
@@ -2568,47 +2566,35 @@ class Scheduler(
 
             req.init_next_round_input(self.tree_cache)
 
-            # PP tree-match consensus (Plan A): truncate ``prefix_indices``
-            # to the PP-MIN length agreed via the bootstrap+L3 ring. Each
-            # rank's local match_prefix can return a different length due
-            # to per-rank tree state divergence (eviction asymmetry from
-            # per-rank L3 prefetch slot pressure -- see logs/sglang_crash
-            # _pp*_1782082* for the IPC mismatch crash this fixes).
+            # PP tree-match consensus: truncate ``prefix_indices`` to
+            # the PP-MIN length agreed via the bootstrap+tree-match
+            # ring. Per-rank match_prefix can return different lengths
+            # because tree state diverges across ranks (per-rank
+            # eviction, async L3 prefetch insert timing). Without the
+            # truncation, ranks compute different ``extend_input_len``
+            # for the same batch and the kernel sees a shape mismatch.
             #
-            # Defer admission for rids without consensus yet. Each rid
-            # is contributed to the ring at PHASE A on every mb_id while
-            # in waiting_queue; consensus arrives ~pp_loop_size mb_ids
-            # later. Once admitted (popped below), the entry is removed
-            # from the agreed dict.
+            # Defer admission for rids without consensus yet (admitted
+            # next mb_id once consensus arrives ~pp_loop_size mb_ids
+            # after the rid first enters the waiting queue).
             if self.enable_hicache_storage and self._tree_cache_supports_l3_handoff:
                 agreed_tree_len = self.tree_cache.peek_agreed_tree_match_len(req.rid)
-                # Total local prefix at this moment is device-resident
-                # (in req.prefix_indices) PLUS host-resident (added later
-                # by PrefillAdder.add_one_req via init_load_back).
                 local_device_len = len(req.prefix_indices)
                 local_host_len = int(getattr(req, "host_hit_length", 0) or 0)
                 local_match_len = local_device_len + local_host_len
-                # CRITICAL under PP>1: force host_hit_length to 0 to
-                # disable PrefillAdder's init_load_back path. The host
-                # residency on each rank's tree is per-rank state with
-                # no consensus tracking; PrefillAdder appends host-loaded
-                # slots to req.prefix_indices AFTER admit log fires,
-                # which means per-rank prefix grows divergently by
-                # host_hit_length even when device-only consensus is
-                # consistent (observed in dump 1782154361357: pp5 had
-                # local_host=1024 while pp0-4 had 0; all ranks saw
-                # agreed=1024 (stale from earlier round when all had
-                # 1024); pp5 admitted with init_load_back -> prefix=1024,
-                # others without -> prefix=0; ring lag prevents the
-                # NEW round's agreed=0 from arriving in time).
-                # PP=1 unaffected (no ring, no cross-rank issue).
+                # Force host_hit_length=0 to disable PrefillAdder's
+                # init_load_back path. Per-rank host residency on the
+                # radix tree has no consensus mechanism that can keep
+                # up with the ring's rotation lag (>=1 round), so
+                # PrefillAdder appending host-loaded slots to
+                # ``req.prefix_indices`` after admit causes per-rank
+                # divergent prefix growth. Sacrifice host-cache fast
+                # path for cross-rank determinism. PP=1 unaffected.
                 req.host_hit_length = 0
                 if hasattr(req, "swa_host_hit_length"):
                     req.swa_host_hit_length = 0
                 if hasattr(req, "mamba_host_hit_length"):
                     req.mamba_host_hit_length = 0
-                # Per-rank log: capture each admit decision so cross-rank
-                # diff pinpoints the rid where decisions diverge.
                 try:
                     from sglang.srt.managers.scheduler_components.pp_admit_diag import (
                         get_logger as _pp_admit_get_logger,
@@ -2630,12 +2616,11 @@ class Scheduler(
                             agreed_len="None",
                             action="defer",
                         )
-                    # No consensus yet -- skip this rid this mb_id;
-                    # init_next_round_input was idempotent so re-running
-                    # next mb_id is fine.
+                    # No consensus yet -- defer to next mb_id.
+                    # init_next_round_input is idempotent.
                     continue
-                # Truncate device-resident prefix to PP-MIN. Host part
-                # was already forced to 0 above; only device matters.
+                # Truncate device-resident prefix to the PP-MIN. Host
+                # part was already zeroed above.
                 if agreed_tree_len < local_device_len:
                     req.prefix_indices = req.prefix_indices[:agreed_tree_len]
                     if req.cache_protected_len > agreed_tree_len:
@@ -2656,40 +2641,26 @@ class Scheduler(
                         action="admit",
                     )
 
-            # NOTE: per-req L3 inject (peek_prefetch_device_indices + cat)
-            # was removed in favor of synchronous tree-insert at
-            # check_prefetch_progress time (Y plan). The L3 prefix is now
-            # in the radix tree; init_next_round_input above already saw
-            # it via match_prefix. Plan A tree-match PP-MIN truncation
-            # handles cross-rank state divergence.
-
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
 
-            # Whether this req was actually admitted to the running batch
-            # this iter. add_one_req returns CONTINUE in the common case,
-            # but it can ALSO return OTHER when the req was admitted as a
-            # chunked-prefill *tail* that exhausted rem_chunk_tokens
-            # (PrefillAdder.add_one_req line 815-819 -> budget_state()
-            # returns OTHER when rem_chunk_tokens hits 0 right after the
-            # append). In that case the req IS in can_run_list and WILL
-            # be scheduled, but `res != CONTINUE` so a CONTINUE-only
-            # check would silently skip the L3 handoff cleanup -- the
-            # exact orphan path the diagnostic log pinned (rid sat in
-            # _prefetch_device_indices_by_reqid forever, leaking 1 page).
-            #
-            # Detect "actually admitted" by checking can_run_list's tail.
+            # add_one_req returns CONTINUE in the common case, but can
+            # also return OTHER when the req is admitted as a
+            # chunked-prefill tail that exhausts rem_chunk_tokens
+            # (PrefillAdder.add_one_req: budget_state() returns OTHER
+            # when rem_chunk_tokens hits 0 right after the append). In
+            # that case the req IS in can_run_list and WILL be
+            # scheduled, so detect "actually admitted" by checking the
+            # can_run_list tail rather than gating on res == CONTINUE.
             req_was_admitted = (
                 bool(adder.can_run_list) and adder.can_run_list[-1] is req
             )
 
-            # Drain the Plan A tree-match consensus entry on successful
-            # admit so the dict stays bounded. Per-req L3 inject was
-            # removed (Y plan -- prefetch now inserts directly into the
-            # radix tree via check_prefetch_progress, no side channel).
+            # Drain the tree-match consensus entry on successful admit
+            # so the dict stays bounded.
             if (
                 req_was_admitted
                 and self.enable_hicache_storage

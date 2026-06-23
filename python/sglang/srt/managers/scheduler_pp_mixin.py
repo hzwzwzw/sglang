@@ -37,10 +37,9 @@ from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
-# Optional per-step diagnostic logging for PP-rank scheduling/launch state.
-# Enabled via SGLANG_PP_DESYNC_DIAG=1. Used to debug shape-mismatch crashes
-# caused by L3 prefetch radix-tree desync across PP ranks; harmless
-# otherwise (no collectives, just per-rank logging).
+# Optional per-step diagnostic logging for PP-rank scheduling/launch
+# state. Enabled via SGLANG_PP_DESYNC_DIAG=1. Per-rank logging only,
+# no collectives.
 _PP_DESYNC_DIAG = os.environ.get("SGLANG_PP_DESYNC_DIAG", "0") not in (
     "0",
     "",
@@ -53,19 +52,15 @@ if TYPE_CHECKING:
 
 
 def _pp_desync_log_schedule(self: "Scheduler", mb_id: int, batch) -> None:
-    """Log per-rank scheduling result so we can compare across PP ranks.
-
-    Triggered by SGLANG_PP_DESYNC_DIAG=1. Used to spot the shape-mismatch
-    crash caused by L3 prefetch radix-tree desync (different
-    extend_seq_lens across PP ranks for the same req_id).
+    """Log per-rank scheduling result so cross-rank comparison can spot
+    a shape-mismatch about to happen (different extend_seq_lens for the
+    same rid across ranks).
     """
     pp = self.ps.pp_rank
     tp = self.ps.tp_rank
     step = self.forward_ct
-    # Snapshot consensus state at this schedule moment: exposing this on
-    # crashes pins the moment a rank's L3 view diverges (a rid that's
-    # in _global on one rank but not another at the SAME mb_id is the
-    # signature for cascade desync via chunked_req drift).
+    # Snapshot tree-match consensus state so a crash pins the moment
+    # a rank's view diverges.
     tc = getattr(self, "tree_cache", None)
     g_keys = []
     g_size = 0
@@ -74,7 +69,6 @@ def _pp_desync_log_schedule(self: "Scheduler", mb_id: int, batch) -> None:
         gset = getattr(tc, "_agreed_tree_match_lens", None)
         if gset is not None:
             g_size = len(gset)
-            # Hash stable signature so cross-rank comparison is cheap.
             try:
                 g_keys = sorted(gset.keys()) if isinstance(gset, dict) else sorted(gset)
                 g_keys = [k[-8:] for k in g_keys[:8]]
@@ -132,9 +126,9 @@ def _pp_desync_log_schedule(self: "Scheduler", mb_id: int, batch) -> None:
 def _pp_desync_log_launch(self: "Scheduler", mb_id: int, pp_proxy_tensors) -> None:
     """Log what _pp_launch_batch is about to feed into run_batch.
 
-    Crash signature is ``cur_ext != ipc_hs[0]`` — i.e. local positions
-    tensor length doesn't match the IPC hidden_states length received from
-    the previous PP rank.
+    The crash signature for shape-mismatch is ``cur_ext != ipc_hs[0]``
+    -- local positions tensor length doesn't match the IPC
+    hidden_states length received from the previous PP rank.
     """
     cur = self.cur_batch
     if cur is None:
@@ -399,12 +393,9 @@ class SchedulerPPMixin:
         send_consensus_bootstrapped_work = []
         send_release_work = []
 
-        # Tree-match consensus ring (per-iter, mirrors bootstrap/release).
-        # Enabled iff the tree cache exposes the consensus state -- without
-        # the ring, admit-time tree-match truncation is skipped.
-        # All ranks must compute the same flag value or the ring will
-        # desync (mismatched send/recv counts). Same config across ranks =>
-        # same flag.
+        # Tree-match consensus ring (per-iter, mirrors bootstrap/release
+        # ring shape). All ranks must compute the same flag value or
+        # the ring desyncs (mismatched send/recv counts).
         l3_consensus_ring_enabled = self.enable_hicache_storage and hasattr(
             self.tree_cache, "_agreed_tree_match_lens"
         )
@@ -470,10 +461,8 @@ class SchedulerPPMixin:
                 batch = self.get_new_batch_prefill()
                 if _PP_DESYNC_DIAG:
                     _pp_desync_log_schedule(self, mb_id, batch)
-                # Crash-diag ring: record minimal per-mb_id schedule state
-                # so a later crash dump shows the last few seconds of
-                # batch composition + chunked_req identity. Tiny ~150 us
-                # cost per mb_id; bounded by the deque's maxlen.
+                # Append per-mb_id schedule snapshot to the crash-diag
+                # ring (~100us/call, bounded by the deque's maxlen).
                 if self.crash_diag.enabled:
                     _crash_diag_record_schedule(self, mb_id, batch)
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
@@ -541,21 +530,14 @@ class SchedulerPPMixin:
                 )
 
                 if bmbs[next_mb_id] is not None:
-                    # Combined recv when L3 ring is enabled: consensus
-                    # payload is a (bootstrapped, prefetch_done_dict,
-                    # tree_match_dict) tuple produced by
-                    # _pp_pd_send_consensus_bootstrap_and_l3_done_ids.
-                    # tree_match_dict is rid -> agreed page-aligned
-                    # match_prefix length (PP-MIN). Backward-compat
-                    # accepts 2-tuple legacy payload during rolling
-                    # deploys; new field defaults to {}.
+                    # Combined recv when the consensus ring is enabled:
+                    # payload is (bootstrapped_rids, tree_match_dict).
+                    # tree_match_dict is rid -> PP-MIN page-aligned
+                    # match_prefix length. Legacy 3-tuple payloads
+                    # (with a removed prefetch_done dict in the middle)
+                    # are accepted for rolling-deploy compatibility.
                     raw = self._pp_recv_pyobj_from_prev_stage()
                     if l3_consensus_ring_enabled:
-                        # Backward-compat: 3-tuple payloads from legacy
-                        # peers (with prefetch_done dict in the middle)
-                        # are accepted but the L3 dict is dropped on the
-                        # floor. Per-req L3 inject was removed (Y plan)
-                        # so tree_match is the only consensus we apply.
                         if len(raw) == 3:
                             (
                                 next_consensus_bootstrapped_rids,
@@ -567,22 +549,15 @@ class SchedulerPPMixin:
                                 next_consensus_bootstrapped_rids,
                                 next_tree_match_payload,
                             ) = raw
-                        # Apply tree-match consensus. Truncates per-rank
-                        # match_prefix divergence to PP-MIN so admit
-                        # uses the same prefix length on every rank.
                         if next_tree_match_payload:
                             tc = self.tree_cache
                             try:
                                 tc.apply_tree_match_consensus(next_tree_match_payload)
                             except AttributeError:
-                                # Older tree_cache without the API; admit
-                                # truncation will skip silently.
+                                # Older tree_cache without the API;
+                                # admit truncation skips silently.
                                 pass
                             next_consensus_tree_match_rids = next_tree_match_payload
-                            # Per-rank log: capture exactly what consensus
-                            # this rank received this mb_id so we can
-                            # diff across ranks and find the round where
-                            # values diverged for a given rid.
                             try:
                                 from sglang.srt.managers.scheduler_components.pp_admit_diag import (
                                     get_logger as _pp_admit_get_logger,
@@ -640,9 +615,6 @@ class SchedulerPPMixin:
                             bootstrapped_rids,
                             tree_match_rids,
                         )
-                        # Per-rank log: capture exactly what tree_match
-                        # values this rank is forwarding (PHASE A
-                        # contribution + intersect output combined).
                         try:
                             from sglang.srt.managers.scheduler_components.pp_admit_diag import (
                                 get_logger as _pp_admit_get_logger,
@@ -1226,24 +1198,17 @@ class SchedulerPPMixin:
     def _pp_pd_get_bootstrap_and_l3_done_ids(self: Scheduler):
         """Combined PHASE A intersect for bootstrap + tree-match length.
 
-        Wire format on the ring (per non-first rank):
+        Wire format (per non-first rank):
             recv  ([prev_good, prev_bad], prev_tree_match_dict)
             send  ([new_good,  new_bad],  new_tree_match_dict)
 
-        tree_match is a ``dict[rid, page_aligned_match_len]`` for each rid
-        in the local waiting queue. Intersected by PP-MIN so the
-        consensus carries the agreed length; admit truncates
-        ``req.prefix_indices`` accordingly. Without the tree-match
-        consensus, per-rank tree state divergence (L3 prefetch inserts
-        arriving asynchronously across ranks; eviction asymmetry under
-        pool pressure) leaves different ranks computing different prefix
-        lengths for the same rid -> different ``extend_input_len`` ->
-        IPC shape mismatch crash.
-
-        Per-req L3 inject was removed (Y plan). The L3 prefix is now
-        inserted directly into the radix tree via
-        ``check_prefetch_progress``; tree-match consensus handles the
-        cross-rank divergence that results from PP-async inserts.
+        tree_match is ``dict[rid, page_aligned_match_len]`` for every
+        rid in the local waiting queue, intersected by PP-MIN. The
+        agreed length is consumed at admit time to truncate
+        ``req.prefix_indices`` so all ranks use the same
+        ``extend_input_len``. Without this, per-rank tree state
+        divergence (eviction asymmetry, async L3 inserts) yields
+        per-rank prefix lengths -> kernel shape mismatch.
         """
         local_good, local_bad = self.get_rids(
             self.disagg_prefill_bootstrap_queue.queue,
@@ -1257,9 +1222,9 @@ class SchedulerPPMixin:
             return [local_good, local_bad], local_tree_match
 
         payload = self._pp_recv_pyobj_from_prev_stage()
-        # Backward-compat: accept legacy 3-tuple (with prefetch_done_dict)
-        # during a rolling deploy. Drop the middle field; we only use
-        # tree-match now.
+        # Backward-compat: accept a legacy 3-tuple payload (with the
+        # removed prefetch_done dict in the middle) during rolling
+        # deploys. Only the tree-match field is used now.
         if len(payload) == 3:
             prev_bootstrapped, _legacy_prefetch_done, prev_tree_match = payload
         else:
@@ -1268,9 +1233,9 @@ class SchedulerPPMixin:
 
         good = list(set(prev_good) & set(local_good))
         bad = list(set(prev_bad) | set(local_bad))
-        # MIN over PP ranks for tree-match length: a rid is in consensus
-        # only if every rank reported it, and the agreed length is the
-        # smallest one any rank's local match_prefix returned.
+        # PP-MIN on tree-match length: a rid is in consensus only if
+        # every rank reported it; agreed length is the smallest local
+        # match any rank returned.
         tree_match = {
             rid: min(prev_tree_match[rid], local_tree_match[rid])
             for rid in (set(prev_tree_match) & set(local_tree_match))
@@ -1326,30 +1291,25 @@ class SchedulerPPMixin:
         )
 
     def _compute_local_tree_match_lens(self: Scheduler) -> Dict[str, int]:
-        """Compute per-rid local ``match_prefix`` length for every rid in
-        the waiting queue.
+        """Compute per-rid local ``match_prefix`` length for every rid
+        in the waiting queue.
 
-        Used for the PP-MIN tree-match consensus contribution. Each rank
-        builds the same RadixKey for each rid (token-content keyed) but
-        their local trees may differ in eviction state -- the resulting
-        match length is what diverges across PP. Taking MIN at PHASE A
-        intersect and applying at admit gives every rank the same
-        ``extend_input_len`` for the same rid.
+        Used as this rank's contribution to the PP-MIN tree-match
+        consensus. Each rank builds the same RadixKey for the same
+        token content, but local trees may differ in eviction state,
+        so match lengths diverge -- intersect MIN ensures every rank
+        admits with the same prefix length.
 
-        Contributes for EVERY rid in waiting_queue every mb_id, including
-        cache-hit reqs deferred awaiting consensus. A previous version
-        skipped reqs whose ``prefix_indices`` was already non-empty
-        (intended for chunked mid-stream reqs), but chunked reqs leave
-        waiting_queue for ``chunked_req`` after first admit so the skip
-        only ever filtered DEFERRED cache-hit reqs -- which is exactly
-        the wrong direction (those rids never reached the consensus
-        ring, never got an agreed_len, and admit deferred them
-        infinitely; observed in logs/sglang_pp_admit_pp*_tp0.log
-        showing rids deferred 7K+ times never making it to PHASE_A_OUT).
+        Contributes for EVERY rid in waiting_queue every mb_id,
+        including ones whose ``prefix_indices`` was set on a previous
+        deferred admit attempt; otherwise cache-hit rids stuck on
+        defer never reach the consensus ring.
 
-        Returns ``dict[rid, page_aligned_match_len]``. Empty when the
-        tree cache has no ``match_prefix`` API (decode-only, etc.) or
-        the waiting queue is empty.
+        Returns ``dict[rid, device_match_len]`` (page-aligned). Empty
+        when the tree cache has no ``match_prefix`` API or the queue
+        is empty. Host residency is intentionally excluded -- the
+        admit path zeroes ``host_hit_length`` to keep the cross-rank
+        load_back path deterministic.
         """
         tc = getattr(self, "tree_cache", None)
         if tc is None or not hasattr(tc, "match_prefix"):
@@ -1363,7 +1323,6 @@ class SchedulerPPMixin:
         except Exception:  # noqa: BLE001
             return {}
         result: Dict[str, int] = {}
-        # Lazy import to avoid circular; module-level guard checks env once.
         try:
             from sglang.srt.managers.scheduler_components.pp_admit_diag import (
                 get_logger as _pp_admit_get_logger,
@@ -1384,9 +1343,9 @@ class SchedulerPPMixin:
                 if not fill_ids:
                     result[req.rid] = 0
                     continue
-                # Cap at input length minus 1 so we don't claim the
-                # final token as a cache hit (mirrors
-                # _compute_max_prefix_len behavior in schedule_batch.py).
+                # Cap at input_len-1 so we don't claim the final token
+                # as a cache hit (matches _compute_max_prefix_len in
+                # schedule_batch.py).
                 token_ids_to_match = fill_ids[: max(0, len(fill_ids) - 1)]
                 if not token_ids_to_match:
                     result[req.rid] = 0
@@ -1400,25 +1359,12 @@ class SchedulerPPMixin:
                         req=req,
                     )
                 )
-                # Contribute DEVICE-resident match length only. We
-                # explicitly do NOT include host_hit_length: per-rank
-                # host residency on the radix tree (set by
-                # cache_finished_req's mooncake write-back; consumed
-                # by PrefillAdder.add_one_req via init_load_back) has no
-                # consensus mechanism that can keep up with the ring's
-                # rotation lag (>=1 round). Forcing host_hit_length=0
-                # at admit (in scheduler.py admit path) is the safer
-                # path under PP>1; the host-cache-bypass cost is a
-                # constant lost-fetch, not a divergent crash.
                 dev = match_result.device_indices
                 try:
                     n = dev.numel()
                 except AttributeError:
                     n = len(dev) if dev is not None else 0
                 result[req.rid] = int(n)
-                # Per-rank log: rid + local_match + token-content hash
-                # so cross-rank diff can verify "same content -> same
-                # match length" or pinpoint the rank that diverges.
                 if _diag is not None and _diag.enabled:
                     _diag.log(
                         "LOCAL_TREE_MATCH",
