@@ -45,6 +45,89 @@ class PPBatchMetadata:
     can_run_cuda_graph: bool
 
 
+def _crash_diag_record_schedule(self: "Scheduler", mb_id: int, batch) -> None:
+    """Append a per-mb_id schedule snapshot to the crash-diag ring.
+
+    Captures the minimum needed to retrace state divergence after a
+    crash: req identities + extend lens + prefix lens, chunked_req,
+    and the cache-controller queue sizes. Cap reqs to 8 for size.
+    """
+    try:
+        cur = batch
+        reqs_summary = []
+        if cur is not None and hasattr(cur, "reqs"):
+            for r in cur.reqs[:8]:
+                reqs_summary.append(
+                    (
+                        r.rid[-12:],
+                        getattr(r, "extend_input_len", None),
+                        (
+                            len(r.prefix_indices)
+                            if getattr(r, "prefix_indices", None) is not None
+                            else 0
+                        ),
+                        getattr(r, "storage_hit_length", 0),
+                    )
+                )
+        tc = getattr(self, "tree_cache", None)
+        cc = getattr(tc, "cache_controller", None) if tc is not None else None
+        chunked = getattr(self, "chunked_req", None)
+        self.crash_diag.record(
+            "schedule",
+            step=getattr(self, "forward_ct", None),
+            mb_id=mb_id,
+            nreq=(len(cur.reqs) if cur is not None and hasattr(cur, "reqs") else 0),
+            ext_tok=(
+                getattr(cur, "extend_num_tokens", None) if cur is not None else None
+            ),
+            chunked_rid=(chunked.rid[-12:] if chunked is not None else None),
+            waiting=len(getattr(self, "waiting_queue", [])),
+            ack_load=(len(getattr(cc, "ack_load_queue", [])) if cc else 0),
+            ack_write=(len(getattr(cc, "ack_write_queue", [])) if cc else 0),
+            ack_prefetch=(
+                getattr(cc, "ack_prefetch_queue", None).qsize()
+                if cc is not None
+                and getattr(cc, "ack_prefetch_queue", None) is not None
+                else 0
+            ),
+            ongoing_load_back=(len(getattr(tc, "ongoing_load_back", {})) if tc else 0),
+            ongoing_write_through=(
+                len(getattr(tc, "ongoing_write_through", {})) if tc else 0
+            ),
+            reqs=reqs_summary,
+        )
+    except Exception:
+        pass
+
+
+def _crash_diag_record_launch(self: "Scheduler", mb_id: int, pp_proxy_tensors) -> None:
+    """Append a per-mb_id launch snapshot to the crash-diag ring.
+
+    Records the local cur_ext and the IPC hidden_states shape so the
+    cur_ext != ipc_hs[0] crash class is directly visible in the dump.
+    """
+    try:
+        cur = self.cur_batch
+        if cur is None:
+            return
+        ipc_hs_shape = None
+        if pp_proxy_tensors is not None:
+            try:
+                ipc_hs_shape = tuple(pp_proxy_tensors["hidden_states"].shape)
+            except (KeyError, AttributeError):
+                ipc_hs_shape = None
+        self.crash_diag.record(
+            "launch",
+            step=getattr(self, "forward_ct", None),
+            mb_id=mb_id,
+            cur_ext=getattr(cur, "extend_num_tokens", None),
+            nreq=len(cur.reqs) if hasattr(cur, "reqs") else 0,
+            ipc_hs=ipc_hs_shape,
+        )
+    except Exception:
+        pass
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -230,6 +313,10 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
+                # Append per-mb_id schedule snapshot to the crash-diag
+                # ring (~100us/call, bounded by the deque's maxlen).
+                if self.crash_diag.enabled:
+                    _crash_diag_record_schedule(self, mb_id, batch)
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
@@ -1171,6 +1258,8 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                if self.crash_diag.enabled:
+                    _crash_diag_record_launch(self, mb_id, pp_proxy_tensors)
                 result = self.run_batch(self.cur_batch, pp_proxy_tensors)
                 set_time_batch(
                     self.cur_batch.reqs,

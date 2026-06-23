@@ -307,6 +307,23 @@ class Scheduler(
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch: Optional[ScheduleBatch] = None
+        # Lightweight crash diag: rolling event ring + on-crash JSON dump.
+        # See SchedulerCrashDiag docstring; disable via SGLANG_CRASH_DIAG=0.
+        from sglang.srt.managers.scheduler_components.crash_diag import (
+            SchedulerCrashDiag,
+        )
+
+        self.crash_diag = SchedulerCrashDiag(pp_rank=pp_rank, tp_rank=tp_rank)
+        # Per-rank disk logger for admit-time consensus debugging
+        # (SGLANG_PP_ADMIT_DIAG=1 to enable). No-op when disabled.
+        try:
+            from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                init_logger as _pp_admit_init_logger,
+            )
+
+            _pp_admit_init_logger(pp_rank=pp_rank, tp_rank=tp_rank)
+        except Exception:
+            pass
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -449,6 +466,16 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+
+        # Wire the crash_diag ring as a tree-write event recorder so
+        # cache_unfinished_req / cache_finished_req calls land in the
+        # rolling event buffer. Used to pinpoint cross-rank tree-state
+        # divergence (different ranks inserting different prefix lengths
+        # for the same rid).
+        try:
+            self.tree_cache._tree_event_recorder = self.crash_diag
+        except Exception:
+            pass
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
@@ -2097,8 +2124,6 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(candidate_req.rid)
-                elif self.enable_hierarchical_cache:
-                    self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -2533,6 +2558,27 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            try:
+                from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                    get_logger as _pp_admit_get_logger,
+                )
+                from sglang.srt.managers.scheduler_components.pp_admit_diag import (
+                    short_rid as _pp_admit_short_rid,
+                )
+
+                _diag = _pp_admit_get_logger()
+                if _diag is not None and _diag.enabled:
+                    _diag.log(
+                        "ADMIT_DECISION",
+                        step=getattr(self, "forward_ct", None),
+                        rid=_pp_admit_short_rid(req.rid),
+                        prefix_len=len(req.prefix_indices),
+                        host_hit=getattr(req, "host_hit_length", 0),
+                        storage_hit=getattr(req, "storage_hit_length", 0),
+                        ext_len=req.extend_input_len,
+                    )
+            except Exception:
+                pass
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3798,10 +3844,41 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
+        # Install signal handlers so siblings can dump on SIGUSR1
+        # broadcast (sent below before SIGQUIT-to-parent path).
+        try:
+            from sglang.srt.managers.scheduler_components.crash_diag import (
+                install_signal_handlers,
+            )
+
+            install_signal_handlers(scheduler)
+        except Exception:
+            pass
+
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()
 
-    except Exception:
+    except Exception as exc:
+        # Dump crash diag (ring + state snapshot) BEFORE the standard
+        # logger.error path so SIGQUIT doesn't truncate the dump.
+        if scheduler is not None and hasattr(scheduler, "crash_diag"):
+            try:
+                scheduler.crash_diag.dump_on_crash(
+                    scheduler, reason="scheduler_exception", exc=exc
+                )
+            except Exception:
+                pass
+        # Broadcast SIGUSR1 to siblings so they each dump too. Parent's
+        # SIGQUIT handler will SIGKILL them moments after we send SIGQUIT
+        # below; without this prior broadcast they never dump.
+        try:
+            from sglang.srt.managers.scheduler_components.crash_diag import (
+                broadcast_sibling_dump,
+            )
+
+            broadcast_sibling_dump()
+        except Exception:
+            pass
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
