@@ -1482,6 +1482,12 @@ class Scheduler(
     def _abort_on_running_timeout(self):
         # NOTE: this should be called before a batch is launched,
         # as current spec-v1 still filters batch inside verify stage.
+        # In PP mode, this check is done in event_loop_pp by
+        # _pp_check_and_sync_running_timeout, which aborts timed-out
+        # requests on the first PP stage and forwards the AbortReq to
+        # every subsequent stage so all stages agree on the abort.
+        if self.ps.pp_size > 1:
+            return
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
         if timeout_s <= 0:
             return
@@ -3515,13 +3521,19 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Delete requests in the running batch
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
-            reqs = self.running_batch.reqs
+        # Delete requests in the running batch.
+        # Under PP, scan every running_mbs / mbs slot (deduped by req) so an
+        # abort applies regardless of which microbatch slot holds the copy.
+        # self.running_batch is aliased to the current mb slot and self.cur_batch
+        # to the previous step's batch, so they alone miss copies in other
+        # slots when pp_max_micro_batch_size > 2.
+        if self.ps.pp_size == 1:
+            inflight_batches = [self.running_batch, self.cur_batch]
         else:
-            reqs = self.running_batch.reqs + self.cur_batch.reqs
+            inflight_batches = [*self.running_mbs, *self.mbs]
 
-        for req in reqs:
+        inflight_reqs = {r for b in inflight_batches if b is not None for r in b.reqs}
+        for req in inflight_reqs:
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
@@ -3529,7 +3541,10 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                req.to_finish = FINISH_ABORT(
+                    recv_req.abort_message,
+                    recv_req.abort_status_code,
+                )
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
