@@ -442,6 +442,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         c4_layer_num = sum(1 for r in stage_ratios if r == 4)
         c128_layer_num = sum(1 for r in stage_ratios if r == 128)
+        stage_layer_num = len(stage_ratios)
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
         self.swa_kv_pool = DeepSeekV4SingleKVPool(
@@ -450,7 +451,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             dtype,
             qk_nope_head_dim,
             qk_rope_head_dim,
-            layer_num,
+            stage_layer_num,
             device,
             enable_memory_saver,
         )
@@ -679,6 +680,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def _swa_local_layer_id(self, layer_id: int) -> int:
         """Convert absolute model layer_id to SWA-pool-local (PP-stage-local) index."""
         return layer_id - self._stage_start
+
+    def get_swa_raw_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
 
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)

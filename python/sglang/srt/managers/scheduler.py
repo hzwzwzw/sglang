@@ -2078,7 +2078,8 @@ class Scheduler(
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
-                new_input_tokens = req.fill_ids[matched_len:]
+                match_end = req._compute_max_prefix_len(len(req.fill_ids))
+                new_input_tokens = req.fill_ids[matched_len:match_end]
 
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
@@ -3552,6 +3553,9 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
